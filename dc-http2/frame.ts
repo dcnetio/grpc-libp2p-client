@@ -30,7 +30,9 @@ export class Http2Frame {
     static createPreface():Uint8Array {  
         return new TextEncoder().encode(HTTP2_PREFACE);  
     }
-
+    static createPongFrame(payload:Uint8Array):Uint8Array {
+        return Http2Frame.createFrame(0x6, 0x1, 0, payload) 
+    }
     // 创建并编码SETTINGS帧  
     static createSettingsFrame(settings = {}) {  
         // 先创建帧对象  

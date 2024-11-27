@@ -67,7 +67,7 @@ export class Libp2pGrpcClient {
             })
             const streamId = this.steamManager.getNextAppLevelStreamId()
             const writer = new StreamWriter(stream.sink)  
-            const parser = new HTTP2Parser();  
+            const parser = new HTTP2Parser(writer);  
             
             parser.onData = (payload,frameHeader) => {//接收数据
                 responseData = payload.subarray(5) 
@@ -158,7 +158,7 @@ export class Libp2pGrpcClient {
             stream = await connection.newStream(this.protocol)
             const streamId = this.steamManager.getNextAppLevelStreamId();  
             const writer = new StreamWriter(stream.sink);  
-            const parser = new HTTP2Parser();  
+            const parser = new HTTP2Parser(writer);  
       
             // Define the onData method to utilize the provided callback  
             parser.onData = async (payload, frameHeader): Promise<void> => {  
