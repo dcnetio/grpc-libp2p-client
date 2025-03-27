@@ -158,7 +158,12 @@ export class HTTP2Parser {
       //     // 处理服务器推送承诺帧
       //     this.handlePushPromiseFrame(frameHeader, frameData);
       //     break;
-
+      case FRAME_TYPES.RST_STREAM:
+        this.endFlag = true;
+        if (this.onEnd) {
+          this.onEnd();
+        }
+        break;
       default:
         console.debug("Unknown frame type:", frameHeader.type);
     }

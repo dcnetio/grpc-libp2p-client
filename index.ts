@@ -9,6 +9,7 @@ import { HPACK} from './dc-http2/hpack'
 import type {Multiaddr} from '@multiformats/multiaddr'
 
 
+
 console.log("ASDDSDS")
 
 
@@ -222,8 +223,8 @@ export class Libp2pGrpcClient {
               await writer.write(finalFrame);  
               await writer.end()
             }  
+            await parser.waitForEndOfStream(0);  
             if (onEndCallback) {  
-              await parser.waitForEndOfStream(0);  
               onEndCallback();  
             }  
           } catch (err: unknown) {  
