@@ -4,7 +4,8 @@
   "description": "grpc-libp2p-client",
   "main": "index.ts",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "nodemon --watch ./ --ext ts,tsx,js,jsx,json --ignore 'src/**/*.test.ts' --exec 'npx yalc push'"
   },
   "author": "",
   "license": "ISC",
@@ -12,7 +13,7 @@
     "@libp2p/interface": "^2.2.1",
     "it-pipe": "^3.0.1",
     "it-pushable": "^3.2.3",
-    "libp2p": "^2.3.1"
-  },
-  "devDependencies": {}
+    "libp2p": "^2.3.1",
+    "nodemon": "^3.1.9"
+  }
 }
