@@ -45,6 +45,15 @@ export class HTTP2Parser {
         this.buffer = newBuffer;
         // 持续处理所有完整的帧
         while (this.buffer.length >= 9) {
+          // 判断是否有HTTP/2前导
+          if (this.buffer.length >= 24 && this.isHttp2Preface(this.buffer)) {
+            console.log("HTTP/2 preface detected");
+            this.buffer = this.buffer.slice(24);
+            // 发送SETTINGS帧
+            const settingFrme = Http2Frame.createSettingsFrame()
+            this.writer.write(settingFrme);
+            break;
+          }
           const frameHeader = this._parseFrameHeader(this.buffer);
           const totalFrameLength = 9 + frameHeader.length;
 
@@ -66,6 +75,15 @@ export class HTTP2Parser {
       console.error("Error processing stream:", error);
       throw error;
     }
+  }
+
+  private isHttp2Preface(buffer: Uint8Array): boolean {
+    const PREFACE = new TextEncoder().encode("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    if (buffer.length < PREFACE.length) return false;
+    for (let i = 0; i < PREFACE.length; i++) {
+      if (buffer[i] !== PREFACE[i]) return false;
+    }
+    return true;
   }
 
   // 等待SETTINGS ACK
