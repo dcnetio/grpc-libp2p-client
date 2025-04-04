@@ -21,11 +21,11 @@ export class HTTP2Parser {
     this.buffer = new Uint8Array(0);
     this.settingsAckReceived = false;
     // 初始化连接级别的流控制窗口大小（默认值：65,535）
-    this.connectionWindowSize = 65535;
+    this.connectionWindowSize = 4<<20;
     // 存储流的Map
     this.streams = new Map();
     // 默认的流级别初始窗口大小
-    this.defaultStreamWindowSize = 65535;
+    this.defaultStreamWindowSize = 4<<20;
     // 结束标志
     this.endFlag = false;
 
@@ -50,7 +50,7 @@ export class HTTP2Parser {
             console.log("HTTP/2 preface detected");
             this.buffer = this.buffer.slice(24);
             // 发送SETTINGS帧
-            const settingFrme = Http2Frame.createSettingsFrame()
+            const settingFrme = Http2Frame.createSettingsFrame();
             this.writer.write(settingFrme);
             break;
           }
@@ -116,7 +116,18 @@ export class HTTP2Parser {
           this.settingsAckReceived = true;
           console.log("Received SETTINGS ACK");
         } else {
-          //接收到Setting请求,stream应该返回一个ACK
+          //接收到Setting请求,进行解析
+          const settingsPayload = frameData.slice(9);
+          const settings = {};
+          for (let i = 0; i < settingsPayload.length; i += 6) {
+            const id = settingsPayload[i];
+            const value =
+              (settingsPayload[i + 1] << 16) |
+              (settingsPayload[i + 2] << 8) |
+              settingsPayload[i + 3];
+            settings[id] = value;
+          }
+          console.log("Received SETTINGS:", settings);
 
           //发送ACK
           if (this.onSettings) {

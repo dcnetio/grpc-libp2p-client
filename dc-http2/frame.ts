@@ -16,7 +16,7 @@ const defaultSettings = {
     [SETTINGS_PARAMETERS.ENABLE_PUSH]: 1,  
     [SETTINGS_PARAMETERS.MAX_CONCURRENT_STREAMS]: 100,  
     [SETTINGS_PARAMETERS.INITIAL_WINDOW_SIZE]: 65535,  
-    [SETTINGS_PARAMETERS.MAX_FRAME_SIZE]: 4 * 1024 * 1024,  
+    [SETTINGS_PARAMETERS.MAX_FRAME_SIZE]:4<<20 , // 4MB
     [SETTINGS_PARAMETERS.MAX_HEADER_LIST_SIZE]: 8192  
 }; 
 
@@ -45,6 +45,23 @@ export class Http2Frame {
         return FrameEncoder.encodeSettingsAckFrame();  
     }  
 
+
+    static createDataFrames(streamId: number, data: Uint8Array,shouldEnd: boolean = false, maxFrameSize: number = 1024): Uint8Array[] {
+        const frames: Uint8Array[] = [];
+        let offset = 0;
+    
+        while (offset < data.length) {
+            const chunkSize = Math.min(maxFrameSize, data.length - offset);
+            const chunk = data.slice(offset, offset + chunkSize);
+            let isEndStream = shouldEnd && (offset + chunkSize >= data.length); // 最后一帧设置 END_STREAM
+            const frame = Http2Frame.createDataFrame(streamId, chunk, isEndStream);
+            frames.push(frame);
+            offset += chunkSize;
+        }
+    
+        return frames;
+    }
+
    static createDataFrame( streamId:number,data:Uint8Array,endStream:boolean = true):Uint8Array {  
         // gRPC 消息格式: 压缩标志(1字节) + 消息长度(4字节) + 消息内容  
         const messageLen = data.length  
@@ -62,7 +79,7 @@ export class Http2Frame {
         // Message content  
         framedData.set(data, 5)  
 
-        const flags = endStream ? 0x1 : 0x0 // END_STREAM flag  
+        const flags = endStream ? 0x01 : 0x0 // END_STREAM flag  
         return Http2Frame.createFrame(0x0, flags, streamId, framedData)  
     }  
 
@@ -90,14 +107,36 @@ export class Http2Frame {
         return Http2Frame.createFrame(0x01, flags, streamId, encodedHeaders)  
     }  
 
+    static createResponseHeadersFrame(streamId:number,headersList:{ [key: string]: string }, endHeaders:boolean = true):Uint8Array {  
+        // 将 headers 编码为 HPACK 格式  
+        const hpack = new HPACK();
+        const encodedHeaders = hpack.encode(headersList);
+        console.log('Encoded:', encodedHeaders);
+        // HEADERS frame flags: END_HEADERS | END_STREAM  
+        const flags = endHeaders ? 0x04 : 0x00  
+        return Http2Frame.createFrame(0x01, flags, streamId, encodedHeaders)  
+    }  
+
+
+    static createTrailersFrame(streamId: number, trailers: { [key: string]: string }): Uint8Array {
+        // 将 trailers 编码为 HPACK 格式
+        const hpack = new HPACK();
+        const encodedTrailers = hpack.encode(trailers);
+    
+        // HEADERS frame flags: END_HEADERS | END_STREAM
+        const flags = 0x05; // 0x04 (END_HEADERS) | 0x01 (END_STREAM)
+        return Http2Frame.createFrame(0x01, flags, streamId, encodedTrailers);
+    }
   
 
     // 创建 SETTINGS 帧  
     static createOriginSettingsFrame(settings = {}):Frame {  
-        // 验证设置值  
-        _validateSettings(settings);  
+    
+       
         // 合并默认值和用户提供的设置  
-        const finalSettings = { ...defaultSettings, ...settings };  
+        const finalSettings = { ...defaultSettings, ...settings }; 
+         // 验证设置值  
+        _validateSettings(finalSettings);   
         // 创建帧  
         const frame = {  
             type: 0x4, // SETTINGS frame type  
