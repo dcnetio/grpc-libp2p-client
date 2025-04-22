@@ -1,20 +1,65 @@
 {
   "name": "grpc-libp2p-client",
   "version": "0.0.1",
+  "type": "module",
   "description": "grpc-libp2p-client",
-  "main": "index.ts",
+  "main": "./dist/index.cjs.js",
+  "module": "./dist/index.esm.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.esm.js",
+      "require": "./dist/index.cjs.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./dc-http2/stream": {
+      "import": "./dist/dc-http2/stream.esm.js",
+      "require": "./dist/dc-http2/stream.cjs.js",
+      "types": "./dist/dc-http2/stream.d.ts"
+    },
+    "./dc-http2/frame": {
+      "import": "./dist/dc-http2/frame.esm.js",
+      "require": "./dist/dc-http2/frame.cjs.js",
+      "types": "./dist/dc-http2/frame.d.ts"
+    },
+    "./dc-http2/parser": {
+      "import": "./dist/dc-http2/parser.esm.js",
+      "require": "./dist/dc-http2/parser.cjs.js",
+      "types": "./dist/dc-http2/parser.d.ts"
+    },
+    "./dc-http2/hpack": {
+      "import": "./dist/dc-http2/hpack.esm.js",
+      "require": "./dist/dc-http2/hpack.cjs.js",
+      "types": "./dist/dc-http2/hpack.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
   "scripts": {
+    "build:w": "rollup -c -w",
+    "build": "rollup -c",
     "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "nodemon --watch ./ --ext ts,tsx,js,jsx,json --ignore 'src/**/*.test.ts' --exec 'npx yalc push'"
   },
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@libp2p/interface": "^2.2.1",
+    "@libp2p/interface": "^2.9.0",
     "it-pipe": "^3.0.1",
     "it-pushable": "^3.2.3",
-    "libp2p": "^2.3.1",
-    "nodemon": "^3.1.9",
+    "libp2p": "^2.8.1",
     "@multiformats/multiaddr": "^12.4.0"
+  },
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^28.0.3",
+    "@rollup/plugin-json": "^6.1.0",
+    "@rollup/plugin-node-resolve": "^16.0.1",
+    "@rollup/plugin-typescript": "^12.1.2",
+    "nodemon": "^3.1.9",
+    "rollup-plugin-dts": "^6.2.1",
+    "tslib": "^2.8.1",
+    "typescript": "^5.8.3"
   }
 }
