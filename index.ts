@@ -6,7 +6,7 @@ import { Http2Frame } from './dc-http2/frame';
 import  type { Stream } from '@libp2p/interface';
 import { HPACK} from './dc-http2/hpack'
 
-import type {Multiaddr} from '@multiformats/multiaddr'
+import type { Multiaddr } from '@multiformats/multiaddr';
 
 
 
