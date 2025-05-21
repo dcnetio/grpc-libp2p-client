@@ -146,11 +146,10 @@ export class Libp2pGrpcClient {
         onEndCallback?: () => void,  
         onErrorCallback?: (error: unknown) => void,    
       ): Promise<void> {  
+        let timeoutHandle ;
         const timeoutPromise = new Promise<never>((_, reject) =>  
-          setTimeout(() => reject(new Error('Operation timed out')), timeout)  
+          timeoutHandle = setTimeout(() => reject(new Error('Operation timed out')), timeout)  
         );  
-        let exitFlag = false;
-        let errMsg = '';
         const hpack = new HPACK()
         const operationPromise = (async () => {  
           let stream: Stream | null = null;
@@ -160,13 +159,12 @@ export class Libp2pGrpcClient {
             const streamId = this.steamManager.getNextAppLevelStreamId();  
             const writer = new StreamWriter(stream.sink);  
             const parser = new HTTP2Parser(writer);  
-      
+           clearTimeout(timeoutHandle)
             // Define the onData method to utilize the provided callback  
             parser.onData = async (payload, frameHeader): Promise<void> => {  
               try {  
                 onDataCallback(payload.subarray(5));  
               } catch (error: unknown) {  
-                console.error('Error processing data:', error);  
                 if (onErrorCallback) {  
                   onErrorCallback(error);  
                 } else {  
@@ -185,8 +183,13 @@ export class Libp2pGrpcClient {
                 if (plainHeaders.get('grpc-status') === '0') {
                     console.log('gRPC call success')
                 } else if (plainHeaders.get('grpc-status') !== undefined) {
-                    exitFlag = true
-                    errMsg = plainHeaders.get('grpc-message') || 'gRPC call failed'
+                    const errMsg = plainHeaders.get('grpc-message') || 'gRPC call failed'
+                    const err  = new Error(errMsg)
+                     if (onErrorCallback) {  
+                      onErrorCallback(err);  
+                    } else {  
+                      throw err;  
+                    }  
                 }
             }
             parser.processStream(stream);  
