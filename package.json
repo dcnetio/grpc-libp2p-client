@@ -47,10 +47,11 @@
   "license": "ISC",
   "dependencies": {
     "@libp2p/interface": "^2.9.0",
+    "@multiformats/multiaddr": "^12.4.0",
+    "@rollup/plugin-terser": "^0.4.4",
     "it-pipe": "^3.0.1",
     "it-pushable": "^3.2.3",
-    "libp2p": "^2.8.1",
-    "@multiformats/multiaddr": "^12.4.0"
+    "libp2p": "^2.8.1"
   },
   "devDependencies": {
     "@rollup/plugin-commonjs": "^28.0.3",
