@@ -93,7 +93,7 @@ export class Http2Frame {
             'content-type': 'application/grpc+proto',  
             'user-agent': 'grpc-web-client/0.1',  
             'accept': 'application/grpc+proto',  
-            'grpc-timeout': '20S'  
+            'grpc-timeout': '3600S'  
         };  
         if (token) {  
             headersList['authorization'] = `Bearer ${token}`  

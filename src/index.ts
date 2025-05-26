@@ -146,9 +146,9 @@ export class Libp2pGrpcClient {
         onEndCallback?: () => void,  
         onErrorCallback?: (error: unknown) => void,    
       ): Promise<void> {  
-        let timeoutHandle ;
+         let timeoutHandle ;
         const timeoutPromise = new Promise<never>((_, reject) =>  
-          timeoutHandle = setTimeout(() => reject(new Error('Operation timed out')), timeout)  
+         timeoutHandle = setTimeout(() => reject(new Error('Operation timed out')), timeout)  
         );  
         const hpack = new HPACK()
         const operationPromise = (async () => {  
@@ -159,7 +159,7 @@ export class Libp2pGrpcClient {
             const streamId = this.steamManager.getNextAppLevelStreamId();  
             const writer = new StreamWriter(stream.sink);  
             const parser = new HTTP2Parser(writer);  
-           clearTimeout(timeoutHandle)
+            clearTimeout(timeoutHandle)
             // Define the onData method to utilize the provided callback  
             parser.onData = async (payload, frameHeader): Promise<void> => {  
               try {  
@@ -248,7 +248,6 @@ export class Libp2pGrpcClient {
         })();  
         return Promise.race([operationPromise, timeoutPromise]);  
       }    
-      
 }
 
 
