@@ -66,7 +66,7 @@ export default [
   {
     input: 'src/index.ts',
     output: {
-      file: 'dist/grpc-libp2p-client.browser.js', // 未压缩版本
+      file: 'dist/grpc.js', // 未压缩版本
       format: 'umd',
       name: GLOBAL_NAME,
       sourcemap: true,
@@ -96,7 +96,7 @@ export default [
   {
     input: 'src/index.ts',
     output: {
-      file: 'dist/grpc-libp2p-client.browser.min.js', // 压缩版本
+      file: 'dist/grpc.min.js', // 压缩版本
       format: 'umd',
       name: GLOBAL_NAME,
       sourcemap: true,
