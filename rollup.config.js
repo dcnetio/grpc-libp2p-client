@@ -1,3 +1,4 @@
+
 import resolve from '@rollup/plugin-node-resolve';
 import commonjs from '@rollup/plugin-commonjs';
 import typescript from '@rollup/plugin-typescript';
@@ -21,18 +22,67 @@ const external = [
 // 全局变量名
 const GLOBAL_NAME = 'GrpcLibp2pClient';
 
-export default [
-  // 原有的ESM和CJS构建
+// 定义所有需要构建的模块
+const modules = [
   {
     input: 'src/index.ts',
+    name: 'index',
+    outputs: {
+      esm: './dist/index.esm.js',
+      cjs: './dist/index.cjs.js',
+      types: './dist/index.d.ts'
+    }
+  },
+  {
+    input: 'src/dc-http2/stream.ts',
+    name: 'dc-http2/stream',
+    outputs: {
+      esm: './dist/dc-http2/stream.esm.js',
+      cjs: './dist/dc-http2/stream.cjs.js',
+      types: './dist/dc-http2/stream.d.ts'
+    }
+  },
+  {
+    input: 'src/dc-http2/frame.ts',
+    name: 'dc-http2/frame',
+    outputs: {
+      esm: './dist/dc-http2/frame.esm.js',
+      cjs: './dist/dc-http2/frame.cjs.js',
+      types: './dist/dc-http2/frame.d.ts'
+    }
+  },
+  {
+    input: 'src/dc-http2/parser.ts',
+    name: 'dc-http2/parser',
+    outputs: {
+      esm: './dist/dc-http2/parser.esm.js',
+      cjs: './dist/dc-http2/parser.cjs.js',
+      types: './dist/dc-http2/parser.d.ts'
+    }
+  },
+  {
+    input: 'src/dc-http2/hpack.ts',
+    name: 'dc-http2/hpack',
+    outputs: {
+      esm: './dist/dc-http2/hpack.esm.js',
+      cjs: './dist/dc-http2/hpack.cjs.js',
+      types: './dist/dc-http2/hpack.d.ts'
+    }
+  }
+];
+
+// 生成构建配置的函数
+function createBuildConfig(module) {
+  return {
+    input: module.input,
     output: [
       {
-        file: pkg.module, // ESM格式
+        file: module.outputs.esm,
         format: 'esm',
         sourcemap: true
       },
       {
-        file: pkg.main, // CJS格式
+        file: module.outputs.cjs,
         format: 'cjs',
         sourcemap: true
       }
@@ -49,33 +99,39 @@ export default [
       json(),
       typescript(tsconfig)
     ]
-  },
-  
-  // 类型定义文件
-  {
-    input: 'src/index.ts',
+  };
+}
+
+// 生成类型定义配置的函数
+function createTypesConfig(module) {
+  return {
+    input: module.input,
     output: {
-      file: pkg.types,
+      file: module.outputs.types,
       format: 'es'
     },
     plugins: [dts()],
     external
-  },
-  
-  // 新增的浏览器UMD构建
+  };
+}
+
+// 生成所有模块的构建配置
+const buildConfigs = modules.map(createBuildConfig);
+const typesConfigs = modules.map(createTypesConfig);
+
+// 主入口的 UMD 构建（通常只有主入口需要 UMD）
+const umdConfigs = [
+  // 未压缩版本
   {
     input: 'src/index.ts',
     output: {
-      file: 'dist/grpc-libp2p-client.browser.js', // 未压缩版本
+      file: 'dist/grpc.js',
       format: 'umd',
       name: GLOBAL_NAME,
       sourcemap: true,
       exports: 'named',
-      // 确保所有导出都正确挂载到全局对象
       intro: `var global = typeof window !== 'undefined' ? window : this;`
     },
-    // 注意：浏览器版本应该包含所有依赖（除非是全局可用的）
-    // external: [], // 不设置external，以便捆绑所有依赖
     plugins: [
       resolve({
         browser: true,
@@ -87,7 +143,7 @@ export default [
       json(),
       typescript({
         ...tsconfig,
-        target: 'es5' // 确保更广泛的浏览器兼容性
+        target: 'es5'
       })
     ]
   },
@@ -96,14 +152,14 @@ export default [
   {
     input: 'src/index.ts',
     output: {
-      file: 'dist/grpc-libp2p-client.browser.min.js', // 压缩版本
+      file: 'dist/grpc.min.js',
       format: 'umd',
       name: GLOBAL_NAME,
       sourcemap: true,
       exports: 'named',
       intro: `var global = typeof window !== 'undefined' ? window : this;`,
-      compact: true,           // 移除不必要的空白
-      minifyInternalExports: true  // 压缩内部导出
+      compact: true,
+      minifyInternalExports: true
     },
     plugins: [
       resolve({
@@ -118,7 +174,14 @@ export default [
         ...tsconfig,
         target: 'es5'
       }),
-      terser() // 添加压缩
+      terser()
     ]
   }
+];
+
+// 导出所有配置
+export default [
+  ...buildConfigs,
+  ...typesConfigs,
+  ...umdConfigs
 ];
