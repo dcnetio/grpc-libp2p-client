@@ -15,8 +15,8 @@ const defaultSettings = {
     [SETTINGS_PARAMETERS.HEADER_TABLE_SIZE]: 4096,  
     [SETTINGS_PARAMETERS.ENABLE_PUSH]: 1,  
     [SETTINGS_PARAMETERS.MAX_CONCURRENT_STREAMS]: 100,  
-    [SETTINGS_PARAMETERS.INITIAL_WINDOW_SIZE]: 512<<10, // 512k
-    [SETTINGS_PARAMETERS.MAX_FRAME_SIZE]:512<<10 , // 512k
+    [SETTINGS_PARAMETERS.INITIAL_WINDOW_SIZE]: 16<<10, // 16k
+    [SETTINGS_PARAMETERS.MAX_FRAME_SIZE]:16<<10 , // 16k
     [SETTINGS_PARAMETERS.MAX_HEADER_LIST_SIZE]: 8192  
 }; 
 
@@ -46,7 +46,7 @@ export class Http2Frame {
     }  
 
 
-    static createDataFrames(streamId: number, data: Uint8Array,shouldEnd: boolean = false, maxFrameSize: number = 1024): Uint8Array[] {
+    static createDataFrames(streamId: number, data: Uint8Array,shouldEnd: boolean = false, maxFrameSize: number = 16384): Uint8Array[] {
         const frames: Uint8Array[] = [];
         let offset = 0;
     
