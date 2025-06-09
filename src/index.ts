@@ -87,6 +87,12 @@ export class Libp2pGrpcClient {
                 isResponseComplete = true
             }
         }
+        parser.onEnd = () => {//接收结束
+            isResponseComplete = true // 设置响应完成标志
+            if (responseBuffer.length === 0) {
+                responseData = new Uint8Array() // 如果没有数据，返回空数组
+            }
+        }
         parser.onSettings = () => {//接收settings,反馈ack
             console.log('Settings received')
             const ackSettingFrame = Http2Frame.createSettingsAckFrame()

@@ -46,21 +46,52 @@ export class Http2Frame {
     }  
 
 
-    static createDataFrames(streamId: number, data: Uint8Array,shouldEnd: boolean = false, maxFrameSize: number = 16384): Uint8Array[] {
-        const frames: Uint8Array[] = [];
-        let offset = 0;
+    static createDataFrames(streamId: number, data: Uint8Array, shouldEnd: boolean = false, maxFrameSize: number = 16384): Uint8Array[] {
+    const frames: Uint8Array[] = [];
     
-        while (offset < data.length) {
-            const chunkSize = Math.min(maxFrameSize, data.length - offset);
-            const chunk = data.slice(offset, offset + chunkSize);
-            let isEndStream = shouldEnd && (offset + chunkSize >= data.length); // 最后一帧设置 END_STREAM
-            const frame = Http2Frame.createDataFrame(streamId, chunk, isEndStream);
-            frames.push(frame);
-            offset += chunkSize;
-        }
+    // 首先构建完整的 gRPC 消息
+    // 格式: Compressed-Flag(1) + Message-Length(4) + Message-Data
+    const messageLength = data.length;
+    const grpcMessage = new Uint8Array(5 + messageLength);
     
-        return frames;
+    // Compressed-Flag (0 = 不压缩)
+    grpcMessage[0] = 0;
+    
+    // Message-Length (4 bytes) - 整个消息的长度
+    grpcMessage[1] = (messageLength >> 24) & 0xFF;
+    grpcMessage[2] = (messageLength >> 16) & 0xFF;
+    grpcMessage[3] = (messageLength >> 8) & 0xFF;
+    grpcMessage[4] = messageLength & 0xFF;
+    
+    // Message-Data
+    grpcMessage.set(data, 5);
+    
+    // 然后将完整的 gRPC 消息分割成多个 HTTP/2 DATA 帧
+    // HTTP/2 帧头为 9 字节
+    const maxDataPerFrame = maxFrameSize - 9;
+    
+    for (let offset = 0; offset < grpcMessage.length; offset += maxDataPerFrame) {
+        const remaining = grpcMessage.length - offset;
+        const chunkSize = Math.min(maxDataPerFrame, remaining);
+        const chunk = grpcMessage.slice(offset, offset + chunkSize);
+        
+        // 判断是否是最后一个数据块
+        const isLastChunk = (offset + chunkSize) >= grpcMessage.length;
+        const endStream = isLastChunk && shouldEnd;
+        
+        // 创建 HTTP/2 DATA 帧
+        const frame = Http2Frame.createFrame(
+            0x0, // DATA 帧类型
+            endStream ? 0x01 : 0x0, // 只在最后一块且需要结束流时设置 END_STREAM
+            streamId,
+            chunk
+        );
+        
+        frames.push(frame);
     }
+    
+    return frames;
+}
 
    static createDataFrame( streamId:number,data:Uint8Array,endStream:boolean = true):Uint8Array {  
         // gRPC 消息格式: 压缩标志(1字节) + 消息长度(4字节) + 消息内容  
