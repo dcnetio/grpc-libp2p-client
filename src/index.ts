@@ -152,7 +152,6 @@ export class Libp2pGrpcClient {
         parser.onHeaders = (headers,header) => {
             const plainHeaders = hpack.decodeHeaderFields(headers)
             if (plainHeaders.get('grpc-status') === '0') {
-                console.log('gRPC call success')
             } else if (plainHeaders.get('grpc-status') !== undefined) {
                 exitFlag = true
                 errMsg = plainHeaders.get('grpc-message') || 'gRPC call failed'
@@ -287,7 +286,6 @@ export class Libp2pGrpcClient {
         parser.onHeaders = (headers,header) => {
             const plainHeaders = hpack.decodeHeaderFields(headers)
             if (plainHeaders.get('grpc-status') === '0') {
-                console.log('gRPC call success')
             } else if (plainHeaders.get('grpc-status') !== undefined) {
                 const errMsg = plainHeaders.get('grpc-message') || 'gRPC call failed'
                 const err  = new Error(errMsg)
