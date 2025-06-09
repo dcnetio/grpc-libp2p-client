@@ -55,6 +55,7 @@ export class Libp2pGrpcClient {
     let stream:Stream|null = null
     let responseData: Uint8Array | null = null
     let responseBuffer: Uint8Array[] = [] // 添加缓冲区来累积数据
+    let responseDataExpectedLength = -1 // 当前响应的期望长度
     const hpack = new HPACK()
     let exitFlag = false
     let errMsg = ''
@@ -69,13 +70,52 @@ export class Libp2pGrpcClient {
         const streamId = this.steamManager.getNextAppLevelStreamId()
         const writer = new StreamWriter(stream.sink)  
         const parser = new HTTP2Parser(writer);  
-        
+        responseDataExpectedLength  = -1 // 重置期望长度
+        responseBuffer = [] // 重置缓冲区
         parser.onData = (payload,frameHeader) => {//接收数据
-            const grpcData = payload.subarray(5) // 移除 gRPC 长度前缀
-            responseBuffer.push(grpcData)
-            
+            if (responseDataExpectedLength === -1) {//grpc消息头部未读取
+              //提取gRPC消息头部
+              if (payload.length < 5) {
+                return
+              }
+              const compressionFlag = payload[0] // 压缩标志
+              const lengthBytes = payload.slice(1, 5) // 消息长度的4字节
+              responseDataExpectedLength = new DataView(lengthBytes.buffer, lengthBytes.byteOffset).getUint32(0, false) // big-endian
+              if (responseDataExpectedLength < 0) {
+                throw new Error('Invalid gRPC message length')
+              }
+              if (responseDataExpectedLength + 5 >  payload.length) {
+                // 如果当前 payload 不足以包含完整的 gRPC 消息，缓存数据
+                const grpcData = payload.subarray(5) 
+                responseBuffer.push(grpcData)
+                responseDataExpectedLength -= grpcData.length // 更新期望长度
+                return
+              }else {
+                // 如果当前 payload 足以包含完整的 gRPC 消息，重置缓冲区
+                const grpcData = payload.subarray(5)  // 提取完整的 gRPC 消息
+                responseBuffer.push(grpcData)
+                responseData = grpcData
+                isResponseComplete = true
+                responseDataExpectedLength = -1 // 重置期望长度
+              }
+            }else if (responseDataExpectedLength > 0) {//grpc消息头部已读取
+              responseBuffer.push(payload) // 将数据添加到缓冲区
+              responseDataExpectedLength -= payload.length // 更新期望长度
+              if (responseDataExpectedLength <= 0) {
+                // 如果缓冲区中的数据已经完全处理，重置缓冲区
+                responseData = new Uint8Array(responseBuffer.reduce((sum, chunk) => sum + chunk.length, 0))
+                let offset = 0
+                for (const chunk of responseBuffer) {
+                    responseData.set(chunk, offset)
+                    offset += chunk.length
+
+                }
+                responseDataExpectedLength = -1
+                isResponseComplete = true // 设置响应完成标志
+              }
+            }
             // 检查是否是流的最后一个帧（END_STREAM 标志）
-            if (frameHeader && (frameHeader.flags & 0x1)) { // END_STREAM flag
+            if (frameHeader && (frameHeader.flags & 0x1) && !isResponseComplete) { // END_STREAM flag
                 // 合并所有缓冲的数据
                 const totalLength = responseBuffer.reduce((sum, chunk) => sum + chunk.length, 0)
                 responseData = new Uint8Array(totalLength)
@@ -88,10 +128,22 @@ export class Libp2pGrpcClient {
             }
         }
         parser.onEnd = () => {//接收结束
+          if (!isResponseComplete) {
             isResponseComplete = true // 设置响应完成标志
             if (responseBuffer.length === 0) {
                 responseData = new Uint8Array() // 如果没有数据，返回空数组
+            }else{
+                // 合并所有缓冲的数据
+                const totalLength = responseBuffer.reduce((sum, chunk) => sum + chunk.length, 0)
+                responseData = new Uint8Array(totalLength)
+                let offset = 0
+                for (const chunk of responseBuffer) {
+                    responseData.set(chunk, offset)
+                    offset += chunk.length
+                }
+                isResponseComplete = true
             }
+          }
         }
         parser.onSettings = () => {//接收settings,反馈ack
             console.log('Settings received')
