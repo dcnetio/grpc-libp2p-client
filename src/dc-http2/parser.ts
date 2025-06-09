@@ -141,6 +141,10 @@ export class HTTP2Parser {
         if (this.onData) {
           this.onData(frameData.slice(9), frameHeader); // 跳过帧头
         }
+         // 更新窗口大小
+        const dataSize = frameHeader.length;
+        const windowUpdateFrame = Http2Frame.createWindowUpdateFrame(frameHeader.streamId, dataSize);
+        this.writer.write(windowUpdateFrame);
         //判断是否是最后一个帧
         if (
           (frameHeader.flags & FRAME_FLAGS.END_STREAM) ===
@@ -286,7 +290,8 @@ export class HTTP2Parser {
     }
 
     // 确保frameBuffer是Uint8Array类型
-    const buffer = new Uint8Array(frameBuffer);
+  //  const buffer = new Uint8Array(frameBuffer);
+   const buffer = new Uint8Array(frameBuffer.slice(9));
 
     // 读取window size increment (4字节，大端序)
     // 手动计算32位无符号整数，确保最高位为0

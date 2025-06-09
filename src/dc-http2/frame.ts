@@ -45,6 +45,31 @@ export class Http2Frame {
         return FrameEncoder.encodeSettingsAckFrame();  
     }  
 
+    /**
+ * 创建 WINDOW_UPDATE 帧
+ * @param streamId 流ID，0表示连接级别的窗口更新
+ * @param increment 窗口大小增量（必须为正数）
+ * @returns 编码好的 WINDOW_UPDATE 帧
+ */
+static createWindowUpdateFrame(streamId: number, increment: number): Uint8Array {
+    // 验证窗口增量
+    if (increment <= 0 || increment > 2147483647) { // 2^31 - 1
+        throw new Error('Window size increment must be between 1 and 2^31-1');
+    }
+    
+    // 创建4字节的payload
+    const payload = new Uint8Array(4);
+    
+    // 写入窗口大小增量 (31位无符号整数，最高位保留为0)
+    payload[0] = (increment >> 24) & 0x7F; // 只用低7位，确保最高位为0
+    payload[1] = (increment >> 16) & 0xFF;
+    payload[2] = (increment >> 8) & 0xFF;
+    payload[3] = increment & 0xFF;
+    
+    // 创建帧，类型0x8表示WINDOW_UPDATE
+    return Http2Frame.createFrame(0x8, 0x0, streamId, payload);
+}
+
 
     static createDataFrames(streamId: number, data: Uint8Array, shouldEnd: boolean = false, maxFrameSize: number = 16384): Uint8Array[] {
     const frames: Uint8Array[] = [];
