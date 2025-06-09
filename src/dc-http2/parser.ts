@@ -47,7 +47,6 @@ export class HTTP2Parser {
         while (this.buffer.length >= 9) {
           // 判断是否有HTTP/2前导
           if (this.buffer.length >= 24 && this.isHttp2Preface(this.buffer)) {
-            console.log("HTTP/2 preface detected");
             this.buffer = this.buffer.slice(24);
             // 发送SETTINGS帧
             const settingFrme = Http2Frame.createSettingsFrame();
@@ -114,7 +113,6 @@ export class HTTP2Parser {
       case FRAME_TYPES.SETTINGS:
         if ((frameHeader.flags & FRAME_FLAGS.ACK) === FRAME_FLAGS.ACK) {
           this.settingsAckReceived = true;
-          console.log("Received SETTINGS ACK");
         } else {
           //接收到Setting请求,进行解析
           const settingsPayload = frameData.slice(9);
@@ -127,7 +125,6 @@ export class HTTP2Parser {
               settingsPayload[i + 3];
             settings[id] = value;
           }
-          console.log("Received SETTINGS:", settings);
 
           //发送ACK
           if (this.onSettings) {

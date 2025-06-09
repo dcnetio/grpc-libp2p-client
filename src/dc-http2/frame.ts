@@ -132,7 +132,6 @@ export class Http2Frame {
         // 将 headers 编码为 HPACK 格式  
         const hpack = new HPACK();
         const encodedHeaders = hpack.encode(headersList);
-        console.log('Encoded:', encodedHeaders);
         // HEADERS frame flags: END_HEADERS | END_STREAM  
         const flags = endHeaders ? 0x04 : 0x00  
         return Http2Frame.createFrame(0x01, flags, streamId, encodedHeaders)  
@@ -142,7 +141,6 @@ export class Http2Frame {
         // 将 headers 编码为 HPACK 格式  
         const hpack = new HPACK();
         const encodedHeaders = hpack.encode(headersList);
-        console.log('Encoded:', encodedHeaders);
         // HEADERS frame flags: END_HEADERS | END_STREAM  
         const flags = endHeaders ? 0x04 : 0x00  
         return Http2Frame.createFrame(0x01, flags, streamId, encodedHeaders)  
