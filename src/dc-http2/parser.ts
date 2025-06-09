@@ -47,7 +47,6 @@ export class HTTP2Parser {
         while (this.buffer.length >= 9) {
           // 判断是否有HTTP/2前导
           if (this.buffer.length >= 24 && this.isHttp2Preface(this.buffer)) {
-            console.log("HTTP/2 preface detected");
             this.buffer = this.buffer.slice(24);
             // 发送SETTINGS帧
             const settingFrme = Http2Frame.createSettingsFrame();
@@ -114,7 +113,6 @@ export class HTTP2Parser {
       case FRAME_TYPES.SETTINGS:
         if ((frameHeader.flags & FRAME_FLAGS.ACK) === FRAME_FLAGS.ACK) {
           this.settingsAckReceived = true;
-          console.log("Received SETTINGS ACK");
         } else {
           //接收到Setting请求,进行解析
           const settingsPayload = frameData.slice(9);
@@ -127,7 +125,6 @@ export class HTTP2Parser {
               settingsPayload[i + 3];
             settings[id] = value;
           }
-          console.log("Received SETTINGS:", settings);
 
           //发送ACK
           if (this.onSettings) {
@@ -141,10 +138,23 @@ export class HTTP2Parser {
         if (this.onData) {
           this.onData(frameData.slice(9), frameHeader); // 跳过帧头
         }
-         // 更新窗口大小
-        const dataSize = frameHeader.length;
-        const windowUpdateFrame = Http2Frame.createWindowUpdateFrame(frameHeader.streamId, dataSize);
-        this.writer.write(windowUpdateFrame);
+         // 更新流窗口和连接窗口
+    try {
+        // 更新流级别的窗口
+        if (frameHeader.streamId !== 0) {
+            const streamWindowUpdate = Http2Frame.createWindowUpdateFrame(
+                frameHeader.streamId, 
+                frameHeader.length
+            );
+            this.writer.write(streamWindowUpdate);
+        }
+        
+        // 更新连接级别的窗口
+        const connWindowUpdate = Http2Frame.createWindowUpdateFrame(0, frameHeader.length);
+        this.writer.write(connWindowUpdate);
+    } catch (err) {
+        console.error("[HTTP2] Error sending window update:", err);
+    }
         //判断是否是最后一个帧
         if (
           (frameHeader.flags & FRAME_FLAGS.END_STREAM) ===
@@ -321,7 +331,6 @@ export class HTTP2Parser {
       const windowUpdate = this.parseWindowUpdateFrame(payload, frameHeader);
      
       this.connectionWindowSize += windowUpdate.windowSizeIncrement;
-      console.log(`Connection window size increased by ${windowUpdate.windowSizeIncrement}`);
 
       return windowUpdate;
     } catch (error) {
