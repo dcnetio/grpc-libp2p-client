@@ -207,158 +207,326 @@ export class Libp2pGrpcClient {
     return responseData
 }
     
-    async  Call(   
-    method: string,  
-    requestData: Uint8Array,  
-    timeout: number,  
-    mode: 'unary' | 'server-streaming' | 'client-streaming' | 'bidirectional', 
-    onDataCallback: (payload: Uint8Array) => void,  
-    dataSourceCallback?: () => AsyncIterable<Uint8Array>,
-    onEndCallback?: () => void,  
-    onErrorCallback?: (error: unknown) => void,    
-  ): Promise<void> {  
-     let timeoutHandle ;
-    const timeoutPromise = new Promise<never>((_, reject) =>  
-     timeoutHandle = setTimeout(() => reject(new Error('Operation timed out')), timeout)  
-    );  
-    const hpack = new HPACK()
-    const operationPromise = (async () => {  
-      let stream: Stream | null = null;
-      let messageBuffer = new Uint8Array(0) // 用于累积跨帧的消息数据
-      let expectedMessageLength = -1 // 当前消息的期望长度
+  /**
+ * 执行GRPC调用，支持通过context和返回的取消函数控制终止
+ * @param method GRPC方法名
+ * @param requestData 请求数据
+ * @param timeout 超时时间(毫秒)
+ * @param mode 调用模式: 'unary'|'server-streaming'|'client-streaming'|'bidirectional'
+ * @param onDataCallback 数据回调函数
+ * @param dataSourceCallback 客户端流数据源回调
+ * @param onEndCallback 结束回调函数
+ * @param onErrorCallback 错误回调函数
+ * @param context 操作上下文，包含AbortSignal用于取消操作
+ * @returns 取消函数，可随时调用终止操作
+ */
+async Call(   
+  method: string,  
+  requestData: Uint8Array,  
+  timeout: number,  
+  mode: 'unary' | 'server-streaming' | 'client-streaming' | 'bidirectional', 
+  onDataCallback: (payload: Uint8Array) => void,  
+  dataSourceCallback?: () => AsyncIterable<Uint8Array>,
+  onEndCallback?: () => void,  
+  onErrorCallback?: (error: unknown) => void,
+  context?: { signal?: AbortSignal }
+): Promise<() => void> {  
+  // 创建内部AbortController用于控制操作
+  const internalController = new AbortController();
+  let timeoutHandle: any;
+  let stream: Stream | null = null;
+  
+  // 取消函数 - 将在最后返回给调用者
+  const cancelOperation = () => {
+    internalController.abort();
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
+    if (stream) {
+      try {
+        stream.abort(new Error('Operation cancelled'));
+      } catch (err) {
+        console.error('Error closing stream on cancel:', err);
+      }
+    }
+  };
+  
+  // 如果提供了外部信号，监听它
+  if (context?.signal) {
+    // 如果外部信号已经触发中止，立即返回
+    if (context.signal.aborted) {
+      if (onErrorCallback) {
+        onErrorCallback(new Error('Operation aborted by context'));
+      }
+      return cancelOperation;
+    }
+    
+    // 监听外部的abort事件
+    context.signal.addEventListener('abort', () => {
+      cancelOperation();
+    });
+  }
+  
+  // 超时Promise
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutHandle = setTimeout(() => {
+      reject(new Error('Operation timed out'));
+      cancelOperation();
+    }, timeout);
+  });
+  
+  // 主操作Promise
+  const operationPromise = (async () => {  
+    let messageBuffer = new Uint8Array(0); // 用于累积跨帧的消息数据
+    let expectedMessageLength = -1; // 当前消息的期望长度
+    const hpack = new HPACK();
+    
+    try {
+      // 检查是否已经中止
+      if (internalController.signal.aborted) {
+        throw new Error('Operation aborted');
+      }
       
-      try {  
-        const connection = await this.node.dial(this.peerAddr)
-        stream = await connection.newStream(this.protocol)
-        const streamId = this.steamManager.getNextAppLevelStreamId();  
-        const writer = new StreamWriter(stream.sink);  
-        const parser = new HTTP2Parser(writer);  
-        clearTimeout(timeoutHandle)
+      const connection = await this.node.dial(this.peerAddr);
+      stream = await connection.newStream(this.protocol);
+      const streamId = this.steamManager.getNextAppLevelStreamId();  
+      const writer = new StreamWriter(stream.sink);  
+      const parser = new HTTP2Parser(writer);  
+      
+      clearTimeout(timeoutHandle);
+      
+      // 在各个回调中检查是否已中止
+      parser.onData = async (payload, frameHeader): Promise<void> => {
+        // 检查是否已中止
+        if (internalController.signal.aborted) {
+          return;
+        }
         
-        // Define the onData method to utilize the provided callback  
-        parser.onData = async (payload, frameHeader): Promise<void> => {  
-          try {  
-            // 将新数据添加到消息缓冲区
-            const newBuffer = new Uint8Array(messageBuffer.length + payload.length)
-            newBuffer.set(messageBuffer)
-            newBuffer.set(payload, messageBuffer.length)
-            messageBuffer = newBuffer
+        try {  
+          // 将新数据添加到消息缓冲区
+          const newBuffer = new Uint8Array(messageBuffer.length + payload.length);
+          newBuffer.set(messageBuffer);
+          newBuffer.set(payload, messageBuffer.length);
+          messageBuffer = newBuffer;
+          
+          // 处理缓冲区中的完整消息
+          while (messageBuffer.length > 0) {
+            // 如果已经中止，停止处理
+            if (internalController.signal.aborted) {
+              return;
+            }
             
-            // 处理缓冲区中的完整消息
-            while (messageBuffer.length > 0) {
-              // 如果还没有读取消息长度，且缓冲区有足够数据
-              if (expectedMessageLength === -1 && messageBuffer.length >= 5) {
-                // 读取 gRPC 消息头：1字节压缩标志 + 4字节长度
-                const compressionFlag = messageBuffer[0]
-                const lengthBytes = messageBuffer.slice(1, 5)
-                expectedMessageLength = new DataView(lengthBytes.buffer, lengthBytes.byteOffset).getUint32(0, false) // big-endian
-              }
+            // 如果还没有读取消息长度，且缓冲区有足够数据
+            if (expectedMessageLength === -1 && messageBuffer.length >= 5) {
+              // 读取 gRPC 消息头：1字节压缩标志 + 4字节长度
+              const compressionFlag = messageBuffer[0];
+              const lengthBytes = messageBuffer.slice(1, 5);
+              expectedMessageLength = new DataView(lengthBytes.buffer, lengthBytes.byteOffset).getUint32(0, false); // big-endian
+            }
+            
+            // 如果知道期望长度且有足够数据
+            if (expectedMessageLength !== -1 && messageBuffer.length >= expectedMessageLength + 5) {
+              // 提取完整消息（跳过5字节头部）
+              const completeMessage = messageBuffer.slice(5, expectedMessageLength + 5);
               
-              // 如果知道期望长度且有足够数据
-              if (expectedMessageLength !== -1 && messageBuffer.length >= expectedMessageLength + 5) {
-                // 提取完整消息（跳过5字节头部）
-                const completeMessage = messageBuffer.slice(5, expectedMessageLength + 5)
-                
-                // 调用回调处理这个完整消息
-                onDataCallback(completeMessage)
-                
-                // 移除已处理的消息，保留剩余数据
-                messageBuffer = messageBuffer.slice(expectedMessageLength + 5)
-                expectedMessageLength = -1
-              } else {
-                // 没有足够数据构成完整消息，等待更多数据
-                break
-              }
+              // 调用回调处理这个完整消息
+              onDataCallback(completeMessage);
+              
+              // 移除已处理的消息，保留剩余数据
+              messageBuffer = messageBuffer.slice(expectedMessageLength + 5);
+              expectedMessageLength = -1;
+            } else {
+              // 没有足够数据构成完整消息，等待更多数据
+              break;
             }
-          } catch (error: unknown) {  
-            if (onErrorCallback) {  
-              onErrorCallback(error);  
-            } else {  
-              throw error;  
-            }  
+          }
+        } catch (error: unknown) {  
+          if (onErrorCallback) {  
+            onErrorCallback(error);  
+          } else {  
+            throw error;  
           }  
-        };  
+        }  
+      };
+      
+      parser.onSettings = () => {
+        // 检查是否已中止
+        if (internalController.signal.aborted) return;
         
-        parser.onSettings = () => {//接收settings,反馈ack
-            const ackSettingFrame = Http2Frame.createSettingsAckFrame()
-            writer.write(ackSettingFrame)
+        const ackSettingFrame = Http2Frame.createSettingsAckFrame();
+        writer.write(ackSettingFrame);
+      }
+      
+      parser.onHeaders = (headers, header) => {
+        // 检查是否已中止
+        if (internalController.signal.aborted) return;
+        
+        const plainHeaders = hpack.decodeHeaderFields(headers);
+        if (plainHeaders.get('grpc-status') === '0') {
+          // 成功状态
+        } else if (plainHeaders.get('grpc-status') !== undefined) {
+          const errMsg = plainHeaders.get('grpc-message') || 'gRPC call failed';
+          const err = new Error(errMsg);
+          if (onErrorCallback) {  
+            onErrorCallback(err);  
+          } else {  
+            throw err;  
+          }  
         }
-        parser.onHeaders = (headers,header) => {
-            const plainHeaders = hpack.decodeHeaderFields(headers)
-            if (plainHeaders.get('grpc-status') === '0') {
-            } else if (plainHeaders.get('grpc-status') !== undefined) {
-                const errMsg = plainHeaders.get('grpc-message') || 'gRPC call failed'
-                const err  = new Error(errMsg)
-                 if (onErrorCallback) {  
-                  onErrorCallback(err);  
-                } else {  
-                  throw err;  
-                }  
+      }
+      
+      parser.processStream(stream);
+      
+      // 检查是否已中止
+      if (internalController.signal.aborted) {
+        throw new Error('Operation aborted');
+      }
+      
+      // Handshake - send HTTP/2 preface  
+      const preface = Http2Frame.createPreface();  
+      await writer.write(preface);
+      
+      // 检查是否已中止
+      if (internalController.signal.aborted) {
+        throw new Error('Operation aborted');
+      }
+
+      // Send Settings request  
+      const settingFrame = Http2Frame.createSettingsFrame();  
+      await writer.write(settingFrame);
+      
+      // 检查是否已中止
+      if (internalController.signal.aborted) {
+        throw new Error('Operation aborted');
+      }
+      
+      // Wait for the acknowledgement of SETTINGS  
+      await parser.waitForSettingsAck();
+      
+      // 检查是否已中止
+      if (internalController.signal.aborted) {
+        throw new Error('Operation aborted');
+      }
+      
+      // Send Settings ACK  
+      const ackSettingFrame = Http2Frame.createSettingsAckFrame();  
+      await writer.write(ackSettingFrame);
+      
+      // 检查是否已中止
+      if (internalController.signal.aborted) {
+        throw new Error('Operation aborted');
+      }
+
+      // Create header frame  
+      const headerFrame = Http2Frame.createHeadersFrame(streamId, method, true, this.token);  
+      if (mode === 'unary' || mode === 'server-streaming') {  
+        const dataFrames = Http2Frame.createDataFrames(streamId, requestData, true);  
+        await writer.write(new Uint8Array([...headerFrame]));  
+        
+        // 检查是否已中止
+        if (internalController.signal.aborted) {
+          throw new Error('Operation aborted');
+        }
+        
+        for (const dataFrame of dataFrames) {
+          // 检查是否已中止
+          if (internalController.signal.aborted) {
+            throw new Error('Operation aborted');
+          }
+          
+          await writer.write(dataFrame);  
+        }
+      } else if ((mode === 'client-streaming' || mode === 'bidirectional') && dataSourceCallback) {  
+        await writer.write(headerFrame);
+        
+        // 检查是否已中止
+        if (internalController.signal.aborted) {
+          throw new Error('Operation aborted');
+        }
+        
+        if (requestData.length > 0) {
+          const dataFrames = Http2Frame.createDataFrames(streamId, requestData, false); 
+          for (const dataFrame of dataFrames) {
+            // 检查是否已中止
+            if (internalController.signal.aborted) {
+              throw new Error('Operation aborted');
             }
-        }
-        parser.processStream(stream);  
-        // Handshake - send HTTP/2 preface  
-        const preface = Http2Frame.createPreface();  
-        await writer.write(preface);  
-
-        // Send Settings request  
-        const settingFrame = Http2Frame.createSettingsFrame();  
-        await writer.write(settingFrame);  
-        // Wait for the acknowledgement of SETTINGS  
-        await parser.waitForSettingsAck();  
-        // Send Settings ACK  
-        const ackSettingFrame = Http2Frame.createSettingsAckFrame();  
-        await writer.write(ackSettingFrame);  
-       
-
-        // Create header frame  
-        const headerFrame = Http2Frame.createHeadersFrame(streamId, method, true,this.token);  
-        if (mode === 'unary' || mode === 'server-streaming') {  
-          const dataFrames = Http2Frame.createDataFrames (streamId,requestData,  true);  
-          await writer.write(new Uint8Array([...headerFrame]));  
-          for (const dataFrame of dataFrames) {  
+            
             await writer.write(dataFrame);  
           }
-        } else if ((mode === 'client-streaming' || mode === 'bidirectional') && dataSourceCallback) {  
-          await writer.write(headerFrame);  
-          if (requestData.length > 0) {
-            const dataFrames = Http2Frame.createDataFrames(streamId,requestData,  false); 
-            for (const dataFrame of dataFrames) {  
-              await writer.write(dataFrame);  
+        }
+        
+        for await (const chunk of dataSourceCallback()) {
+          // 检查是否已中止
+          if (internalController.signal.aborted) {
+            throw new Error('Operation aborted');
+          }
+          
+          const dataFrames = Http2Frame.createDataFrames(streamId, chunk, false);  
+          for (const dataFrame of dataFrames) {
+            // 检查是否已中止
+            if (internalController.signal.aborted) {
+              throw new Error('Operation aborted');
             }
+            
+            await writer.write(dataFrame);
+          } 
+        }  
+        
+        // 检查是否已中止
+        if (internalController.signal.aborted) {
+          throw new Error('Operation aborted');
         }
-          for await (const chunk of dataSourceCallback()) {  
-            const dataFrames = Http2Frame.createDataFrames( streamId,chunk, false);  
-            for (const dataFrame of dataFrames) {
-              await writer.write(dataFrame);
-            } 
-          }  
-          const finalFrame = Http2Frame.createDataFrame(streamId,new Uint8Array(),  true);  
-          await writer.write(finalFrame);  
-          await writer.end()
-        }  
-        await parser.waitForEndOfStream(0);  
-        if (onEndCallback) {  
-          onEndCallback();  
-        }  
-      } catch (err: unknown) {  
-        if (onErrorCallback) {  
-          onErrorCallback(err);  
+        
+        const finalFrame = Http2Frame.createDataFrame(streamId, new Uint8Array(), true);  
+        await writer.write(finalFrame);  
+        await writer.end();
+      }
+      
+      // 检查是否已中止
+      if (internalController.signal.aborted) {
+        throw new Error('Operation aborted');
+      }
+      
+      await parser.waitForEndOfStream(0);
+      
+      if (onEndCallback) {  
+        onEndCallback();  
+      }  
+    } catch (err: unknown) {
+      // 如果是由于取消导致的错误，使用特定的错误消息
+      if (internalController.signal.aborted && err instanceof Error && err.message === 'Operation aborted') {
+        if (onErrorCallback) {
+          onErrorCallback(new Error('Operation cancelled by user'));
+        }
+      } else if (onErrorCallback) {  
+        onErrorCallback(err);  
+      } else {  
+        if (err instanceof Error) {  
+          console.error('asyncCall error:', err.message);  
         } else {  
-          if (err instanceof Error) {  
-            console.error('asyncCall error:', err.message);  
-          } else {  
-            console.error('asyncCall error:', err);  
-          }  
+          console.error('asyncCall error:', err);  
         }  
-      } finally {
-        if (stream) {
-            await stream.close()
+      }  
+    } finally {
+      if (stream) {
+        try {
+          await stream.close();
+        } catch (err) {
+          console.error('Error closing stream:', err);
         }
-      } 
-    })();  
-    return Promise.race([operationPromise, timeoutPromise]);  
-  }  
+      }
+    } 
+  })();
+  
+  // 执行操作并返回取消函数
+  Promise.race([operationPromise, timeoutPromise]).catch(err => {
+    if (onErrorCallback) {
+      onErrorCallback(err);
+    }
+  });
+  
+  return cancelOperation;
 }
 
 
