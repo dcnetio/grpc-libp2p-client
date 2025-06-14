@@ -230,7 +230,7 @@ async Call(
   onEndCallback?: () => void,  
   onErrorCallback?: (error: unknown) => void,
   context?: { signal?: AbortSignal }
-): Promise<() => void> {  
+) {  
   // 创建内部AbortController用于控制操作
   const internalController = new AbortController();
   let timeoutHandle: any;
@@ -258,7 +258,7 @@ async Call(
       if (onErrorCallback) {
         onErrorCallback(new Error('Operation aborted by context'));
       }
-      return cancelOperation;
+      cancelOperation();
     }
     
     // 监听外部的abort事件
@@ -520,13 +520,7 @@ async Call(
   })();
   
   // 执行操作并返回取消函数
-  Promise.race([operationPromise, timeoutPromise]).catch(err => {
-    if (onErrorCallback) {
-      onErrorCallback(err);
-    }
-  });
-  
-  return cancelOperation;
+  return Promise.race([operationPromise, timeoutPromise])
 }
 
 
