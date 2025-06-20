@@ -21,11 +21,11 @@ export class HTTP2Parser {
     this.buffer = new Uint8Array(0);
     this.settingsAckReceived = false;
     // 初始化连接级别的流控制窗口大小（默认值：65,535）
-    this.connectionWindowSize = 4<<20;
+    this.connectionWindowSize = 4 << 20;
     // 存储流的Map
     this.streams = new Map();
     // 默认的流级别初始窗口大小
-    this.defaultStreamWindowSize = 4<<20;
+    this.defaultStreamWindowSize = 4 << 20;
     // 结束标志
     this.endFlag = false;
 
@@ -77,7 +77,9 @@ export class HTTP2Parser {
   }
 
   private isHttp2Preface(buffer: Uint8Array): boolean {
-    const PREFACE = new TextEncoder().encode("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    const PREFACE = new TextEncoder().encode(
+      "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+    );
     if (buffer.length < PREFACE.length) return false;
     for (let i = 0; i < PREFACE.length; i++) {
       if (buffer[i] !== PREFACE[i]) return false;
@@ -118,12 +120,19 @@ export class HTTP2Parser {
           const settingsPayload = frameData.slice(9);
           const settings = {};
           for (let i = 0; i < settingsPayload.length; i += 6) {
-            const id = settingsPayload[i];
+            // 正确解析：2字节ID + 4字节值
+            const id = (settingsPayload[i] << 8) | settingsPayload[i + 1];
             const value =
-              (settingsPayload[i + 1] << 16) |
-              (settingsPayload[i + 2] << 8) |
-              settingsPayload[i + 3];
+              (settingsPayload[i + 2] << 24) |
+              (settingsPayload[i + 3] << 16) |
+              (settingsPayload[i + 4] << 8) |
+              settingsPayload[i + 5];
+
             settings[id] = value;
+            if (id === 4) {
+              // SETTINGS_INITIAL_WINDOW_SIZE
+              this.defaultStreamWindowSize = value;
+            }
           }
 
           //发送ACK
@@ -138,23 +147,26 @@ export class HTTP2Parser {
         if (this.onData) {
           this.onData(frameData.slice(9), frameHeader); // 跳过帧头
         }
-         // 更新流窗口和连接窗口
-    try {
-        // 更新流级别的窗口
-        if (frameHeader.streamId !== 0) {
+        // 更新流窗口和连接窗口
+        try {
+          // 更新流级别的窗口
+          if (frameHeader.streamId !== 0) {
             const streamWindowUpdate = Http2Frame.createWindowUpdateFrame(
-                frameHeader.streamId, 
-                frameHeader.length
+              frameHeader.streamId,
+              frameHeader.length
             );
             this.writer.write(streamWindowUpdate);
+          }
+
+          // 更新连接级别的窗口
+          const connWindowUpdate = Http2Frame.createWindowUpdateFrame(
+            0,
+            frameHeader.length
+          );
+          this.writer.write(connWindowUpdate);
+        } catch (err) {
+          console.error("[HTTP2] Error sending window update:", err);
         }
-        
-        // 更新连接级别的窗口
-        const connWindowUpdate = Http2Frame.createWindowUpdateFrame(0, frameHeader.length);
-        this.writer.write(connWindowUpdate);
-    } catch (err) {
-        console.error("[HTTP2] Error sending window update:", err);
-    }
         //判断是否是最后一个帧
         if (
           (frameHeader.flags & FRAME_FLAGS.END_STREAM) ===
@@ -233,6 +245,10 @@ export class HTTP2Parser {
     if (frameHeader.length !== 8) {
       throw new Error("PING frame must have a length of 8 bytes");
     }
+    if (frameHeader.flags & FRAME_FLAGS.ACK) {
+      // 是ACK，不需要回应
+      return;
+    }
     // 反馈PONG帧
     const pongFrame = Http2Frame.createPongFrame(frameData.slice(9));
     try {
@@ -300,8 +316,8 @@ export class HTTP2Parser {
     }
 
     // 确保frameBuffer是Uint8Array类型
-  //  const buffer = new Uint8Array(frameBuffer);
-   const buffer = new Uint8Array(frameBuffer.slice(9));
+    //  const buffer = new Uint8Array(frameBuffer);
+    const buffer = new Uint8Array(frameBuffer.slice(9));
 
     // 读取window size increment (4字节，大端序)
     // 手动计算32位无符号整数，确保最高位为0
@@ -329,7 +345,7 @@ export class HTTP2Parser {
   ) {
     try {
       const windowUpdate = this.parseWindowUpdateFrame(payload, frameHeader);
-     
+
       this.connectionWindowSize += windowUpdate.windowSizeIncrement;
 
       return windowUpdate;
