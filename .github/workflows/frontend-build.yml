@@ -18,17 +18,16 @@ jobs:
       uses: actions/setup-node@v4  # 更新到 v4
       with:
         node-version: '20'
-        cache: 'npm'
+        # 暂时禁用缓存，直到问题解决
+        # cache: 'npm'
     
-    # 恢复 node_modules 缓存
-    - name: Cache node modules
-      uses: actions/cache@v3
-      with:
-        path: node_modules
-        key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
-        restore-keys: |
-          ${{ runner.os }}-node-
+    # 关键修复：清理 node_modules 和 package-lock.json
+    - name: Clean installation files
+      run: |
+        rm -rf node_modules
+        rm -f package-lock.json
     
+    # 安装依赖，包括显式安装缺失的原生模块
     - name: Install dependencies
       run: npm i
     
