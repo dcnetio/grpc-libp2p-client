@@ -48,7 +48,7 @@ jobs:
     
     # 保存构建产物为 artifacts
     - name: Upload build artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: production-build
         path: dist/
