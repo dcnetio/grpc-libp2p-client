@@ -29,7 +29,7 @@ jobs:
     
     # 安装依赖，包括显式安装缺失的原生模块
     - name: Install dependencies
-      run: npm ci
+      run: npm i
 
     
     # # 并行运行 lint 和测试
