@@ -1,0 +1,54 @@
+name: Optimized Frontend Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '20'
+        cache: 'npm'
+    
+    # 恢复 node_modules 缓存
+    - name: Cache node modules
+      uses: actions/cache@v3
+      with:
+        path: node_modules
+        key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+        restore-keys: |
+          ${{ runner.os }}-node-
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    # 并行运行 lint 和测试
+    - name: Lint
+      run: npm run lint
+      
+    - name: Test
+      run: npm test
+    
+    # 带环境变量的构建
+    - name: Build
+      env:
+        NODE_ENV: production
+        REACT_APP_API_URL: ${{ secrets.API_URL }}
+      run: npm run build
+    
+    # 保存构建产物为 artifacts
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: production-build
+        path: dist/
