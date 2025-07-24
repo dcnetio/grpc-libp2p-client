@@ -102,7 +102,7 @@ export class StreamWriter {
   private async safeNext() {  
     const result = await this.p.next()  
     if (!result.done) {  
-      this.p._queueSize -= result.value.byteLength  
+      this.p._queueSize -= result.value?result.value.byteLength : 0
     }  
     return result  
   }  
