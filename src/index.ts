@@ -244,7 +244,8 @@ async Call(
     }
     if (stream) {
       try {
-        stream.abort(new Error('Operation cancelled'));
+        //stream.abort(new Error('Operation cancelled'));
+        stream.close();
       } catch (err) {
         console.error('Error closing stream on cancel:', err);
       }
