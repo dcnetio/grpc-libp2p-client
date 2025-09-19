@@ -49,8 +49,8 @@ export class HTTP2Parser {
           if (this.buffer.length >= 24 && this.isHttp2Preface(this.buffer)) {
             this.buffer = this.buffer.slice(24);
             // 发送SETTINGS帧
-            const settingFrme = Http2Frame.createSettingsFrame();
-            this.writer.write(settingFrme);
+            const settingFrame = Http2Frame.createSettingsFrame();
+            this.writer.write(settingFrame as any);
             break;
           }
           const frameHeader = this._parseFrameHeader(this.buffer);
@@ -155,7 +155,7 @@ export class HTTP2Parser {
               frameHeader.streamId,
               frameHeader.length
             );
-            this.writer.write(streamWindowUpdate);
+            this.writer.write(streamWindowUpdate as any);
           }
 
           // 更新连接级别的窗口
@@ -163,7 +163,7 @@ export class HTTP2Parser {
             0,
             frameHeader.length
           );
-          this.writer.write(connWindowUpdate);
+          this.writer.write(connWindowUpdate as any);
         } catch (err) {
           console.error("[HTTP2] Error sending window update:", err);
         }
@@ -252,7 +252,7 @@ export class HTTP2Parser {
     // 反馈PONG帧
     const pongFrame = Http2Frame.createPongFrame(frameData.slice(9));
     try {
-      this.writer.write(pongFrame);
+      this.writer.write(pongFrame as any);
     } catch (error) {
       console.error("Error sending PONG frame:", error);
       throw error;

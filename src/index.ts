@@ -65,7 +65,7 @@ export class Libp2pGrpcClient {
        // const stream = await this.node.dialProtocol(this.peerAddr, this.protocol)
         const connection = await this.node.dial(this.peerAddr)
         stream = await connection.newStream(this.protocol, {
-          maxOutboundStreams: 5
+          maxOutboundStreams: 10
         })
         const streamId = this.steamManager.getNextAppLevelStreamId()
         const writer = new StreamWriter(stream.sink)  
@@ -147,7 +147,7 @@ export class Libp2pGrpcClient {
         }
         parser.onSettings = () => {//接收settings,反馈ack
             const ackSettingFrame = Http2Frame.createSettingsAckFrame()
-            writer.write(ackSettingFrame)
+            writer.write(ackSettingFrame as any);
         }
         parser.onHeaders = (headers,header) => {
             const plainHeaders = hpack.decodeHeaderFields(headers)
@@ -160,19 +160,19 @@ export class Libp2pGrpcClient {
         parser.processStream(stream);
         // 握手
         const preface = Http2Frame.createPreface();  
-        await writer.write(preface)
+        await writer.write(preface as any);
         // 发送Settings请求
         const settingFrme = Http2Frame.createSettingsFrame()
-        await writer.write(settingFrme)
+        await writer.write(settingFrme as any);
         await parser.waitForSettingsAck()
         // 创建头部帧
         const headerFrame = Http2Frame.createHeadersFrame( streamId,method,true,this.token)
-        await writer.write(headerFrame)
+        await writer.write(headerFrame as any);
         // 创建数据帧
         const dataFrames = Http2Frame.createDataFrames( streamId,requestData, true)
         // 发送请求
         for (const dataFrame of dataFrames) {
-            await writer.write(dataFrame)
+            await writer.write(dataFrame as any);
         }
         // 等待responseData 不为空,或超时
         await new Promise((resolve, reject) => {
@@ -244,7 +244,7 @@ async Call(
     }
     if (stream) {
       try {
-        stream.abort(new Error('Operation cancelled'));
+        stream.close();
       } catch (err) {
         console.error('Error closing stream on cancel:', err);
       }
@@ -354,7 +354,7 @@ async Call(
         if (internalController.signal.aborted) return;
         
         const ackSettingFrame = Http2Frame.createSettingsAckFrame();
-        writer.write(ackSettingFrame);
+        writer.write(ackSettingFrame as any);
       }
       
       parser.onHeaders = (headers, header) => {
@@ -384,7 +384,7 @@ async Call(
       
       // Handshake - send HTTP/2 preface  
       const preface = Http2Frame.createPreface();  
-      await writer.write(preface);
+      await writer.write(preface as any);
       
       // 检查是否已中止
       if (internalController.signal.aborted) {
@@ -393,7 +393,7 @@ async Call(
 
       // Send Settings request  
       const settingFrame = Http2Frame.createSettingsFrame();  
-      await writer.write(settingFrame);
+      await writer.write(settingFrame as any);
       
       // 检查是否已中止
       if (internalController.signal.aborted) {
@@ -410,7 +410,7 @@ async Call(
       
       // Send Settings ACK  
       const ackSettingFrame = Http2Frame.createSettingsAckFrame();  
-      await writer.write(ackSettingFrame);
+      await writer.write(ackSettingFrame as any);
       
       // 检查是否已中止
       if (internalController.signal.aborted) {
@@ -421,7 +421,7 @@ async Call(
       const headerFrame = Http2Frame.createHeadersFrame(streamId, method, true, this.token);  
       if (mode === 'unary' || mode === 'server-streaming') {  
         const dataFrames = Http2Frame.createDataFrames(streamId, requestData, true);  
-        await writer.write(new Uint8Array([...headerFrame]));  
+        await writer.write(new Uint8Array([...headerFrame]) as any);  
         
         // 检查是否已中止
         if (internalController.signal.aborted) {
@@ -433,11 +433,11 @@ async Call(
           if (internalController.signal.aborted) {
             throw new Error('Operation aborted');
           }
-          
-          await writer.write(dataFrame);  
+
+          await writer.write(dataFrame as any);  
         }
       } else if ((mode === 'client-streaming' || mode === 'bidirectional') && dataSourceCallback) {  
-        await writer.write(headerFrame);
+        await writer.write(headerFrame as any);
         
         // 检查是否已中止
         if (internalController.signal.aborted) {
@@ -451,8 +451,8 @@ async Call(
             if (internalController.signal.aborted) {
               throw new Error('Operation aborted');
             }
-            
-            await writer.write(dataFrame);  
+
+            await writer.write(dataFrame as any);
           }
         }
         
@@ -469,7 +469,7 @@ async Call(
               throw new Error('Operation aborted');
             }
             
-            await writer.write(dataFrame);
+            await writer.write(dataFrame as any);
           } 
         }  
         
@@ -479,7 +479,7 @@ async Call(
         }
         
         const finalFrame = Http2Frame.createDataFrame(streamId, new Uint8Array(), true);  
-        await writer.write(finalFrame);  
+        await writer.write(finalFrame as any);  
         await writer.end();
       }
       
