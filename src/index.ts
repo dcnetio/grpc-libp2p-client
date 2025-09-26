@@ -63,7 +63,9 @@ export class Libp2pGrpcClient {
     try {
        
        // const stream = await this.node.dialProtocol(this.peerAddr, this.protocol)
-        const connection = await this.node.dial(this.peerAddr)
+        const connection = await this.node.dial(this.peerAddr,{
+              signal: AbortSignal.timeout(timeout)
+            })
         stream = await connection.newStream(this.protocol, {
           maxOutboundStreams: 10
         })
@@ -223,7 +225,7 @@ export class Libp2pGrpcClient {
 async Call(   
   method: string,  
   requestData: Uint8Array,  
-  timeout: number,  
+  timeout: number = 10000,  
   mode: 'unary' | 'server-streaming' | 'client-streaming' | 'bidirectional', 
   onDataCallback: (payload: Uint8Array) => void,  
   dataSourceCallback?: () => AsyncIterable<Uint8Array>,
@@ -287,7 +289,9 @@ async Call(
         throw new Error('Operation aborted');
       }
       
-      const connection = await this.node.dial(this.peerAddr);
+      const connection = await this.node.dial(this.peerAddr,{
+              signal: AbortSignal.timeout(timeout)
+            });
       stream = await connection.newStream(this.protocol);
       const streamId = this.steamManager.getNextAppLevelStreamId();  
       const writer = new StreamWriter(stream.sink);  
