@@ -522,8 +522,12 @@ async Call(
     } 
   })();
   
-  // 执行操作并返回取消函数
-  return Promise.race([operationPromise, timeoutPromise])
+  try {
+    // 执行操作并返回取消函数
+    return Promise.race([operationPromise, timeoutPromise])
+  } catch (error) {
+    return null;
+  }
 }
 
 
