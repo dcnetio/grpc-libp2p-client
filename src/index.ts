@@ -8,7 +8,7 @@ import { HPACK} from './dc-http2/hpack'
 
 import type { Multiaddr } from '@multiformats/multiaddr';
 
-
+const dialTimeout = 20000 // 20秒
 
 
 class StreamManager {  
@@ -51,7 +51,7 @@ export class Libp2pGrpcClient {
     }
     
 
-    async unaryCall(method:string, requestData:Uint8Array,timeout:number): Promise<Uint8Array> {  
+    async unaryCall(method:string, requestData:Uint8Array,timeout:number = 30000): Promise<Uint8Array> {  
     let stream:Stream|null = null
     let responseData: Uint8Array | null = null
     let responseBuffer: Uint8Array[] = [] // 添加缓冲区来累积数据
@@ -64,7 +64,7 @@ export class Libp2pGrpcClient {
        
        // const stream = await this.node.dialProtocol(this.peerAddr, this.protocol)
         const connection = await this.node.dial(this.peerAddr,{
-              signal: AbortSignal.timeout(timeout)
+              signal: AbortSignal.timeout(dialTimeout)
             })
         stream = await connection.newStream(this.protocol, {
           maxOutboundStreams: 10
@@ -225,7 +225,7 @@ export class Libp2pGrpcClient {
 async Call(   
   method: string,  
   requestData: Uint8Array,  
-  timeout: number = 10000,  
+  timeout: number = 30000,  
   mode: 'unary' | 'server-streaming' | 'client-streaming' | 'bidirectional', 
   onDataCallback: (payload: Uint8Array) => void,  
   dataSourceCallback?: () => AsyncIterable<Uint8Array>,
@@ -290,14 +290,12 @@ async Call(
       }
       
       const connection = await this.node.dial(this.peerAddr,{
-              signal: AbortSignal.timeout(timeout)
+              signal: AbortSignal.timeout(dialTimeout)
             });
       stream = await connection.newStream(this.protocol);
       const streamId = this.steamManager.getNextAppLevelStreamId();  
       const writer = new StreamWriter(stream.sink);  
       const parser = new HTTP2Parser(writer);  
-      
-      clearTimeout(timeoutHandle);
       
       // 在各个回调中检查是否已中止
       parser.onData = async (payload, frameHeader): Promise<void> => {
@@ -513,6 +511,7 @@ async Call(
         }  
       }  
     } finally {
+      clearTimeout(timeoutHandle);
       if (stream) {
         try {
           await stream.close();
