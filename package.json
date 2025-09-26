@@ -1,6 +1,6 @@
 {
   "name": "grpc-libp2p-client",
-  "version": "0.0.17",
+  "version": "0.0.18",
   "type": "module",
   "description": "grpc-libp2p-client",
   "main": "./dist/index.cjs.js",
