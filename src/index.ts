@@ -13,16 +13,22 @@ const dialTimeout = 20000 // 20秒
 
 class StreamManager {  
     currentStreamId: number;
+    private streamIdLock: Promise<void> = Promise.resolve();
 
     constructor() {  
       this.currentStreamId = 1; // 从 1 开始，以模拟奇数 ID  
     }  
 
-    getNextAppLevelStreamId() {  
-      const id = this.currentStreamId;  
-      this.currentStreamId += 2; // 确保奇数步进  
-      return id;  
-    }  
+    async getNextAppLevelStreamId(): Promise<number> {
+      // 使用 Promise 链来确保原子性操作
+      return new Promise<number>((resolve) => {
+        this.streamIdLock = this.streamIdLock.then(() => {
+          const id = this.currentStreamId;  
+          this.currentStreamId += 2; // 确保奇数步进  
+          resolve(id);
+        });
+      });
+    }
   } 
 
 
@@ -69,7 +75,7 @@ export class Libp2pGrpcClient {
         stream = await connection.newStream(this.protocol, {
           maxOutboundStreams: 10
         })
-        const streamId = this.steamManager.getNextAppLevelStreamId()
+        const streamId = await this.steamManager.getNextAppLevelStreamId()
         const writer = new StreamWriter(stream.sink)  
         const parser = new HTTP2Parser(writer);  
         responseDataExpectedLength  = -1 // 重置期望长度
@@ -293,7 +299,7 @@ async Call(
               signal: AbortSignal.timeout(dialTimeout)
             });
       stream = await connection.newStream(this.protocol);
-      const streamId = this.steamManager.getNextAppLevelStreamId();  
+      const streamId = await this.steamManager.getNextAppLevelStreamId();  
       const writer = new StreamWriter(stream.sink);  
       const parser = new HTTP2Parser(writer);  
       
