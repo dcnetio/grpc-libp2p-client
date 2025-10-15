@@ -222,10 +222,11 @@ export class Libp2pGrpcClient {
  * @param timeout 超时时间(毫秒)
  * @param mode 调用模式: 'unary'|'server-streaming'|'client-streaming'|'bidirectional'
  * @param onDataCallback 数据回调函数
- * @param dataSourceCallback 客户端流数据源回调
+ * @param dataSourceCallback 客户端流数据源回调，支持单个chunk或批量chunks（使用frames策略优化）
  * @param onEndCallback 结束回调函数
  * @param onErrorCallback 错误回调函数
  * @param context 操作上下文，包含AbortSignal用于取消操作
+ * @param options 调用选项
  * @returns 取消函数，可随时调用终止操作
  */
 async Call(   
@@ -234,10 +235,14 @@ async Call(
   timeout: number = 30000,  
   mode: 'unary' | 'server-streaming' | 'client-streaming' | 'bidirectional', 
   onDataCallback: (payload: Uint8Array) => void,  
-  dataSourceCallback?: () => AsyncIterable<Uint8Array>,
+  dataSourceCallback?: () => AsyncIterable<Uint8Array | Uint8Array[]>,
   onEndCallback?: () => void,  
   onErrorCallback?: (error: unknown) => void,
-  context?: { signal?: AbortSignal }
+  context?: { signal?: AbortSignal },
+  options?: { 
+    batchSize?: number;  // 批量处理的大小
+    maxBatchWaitMs?: number;  // 等待批量数据的最大时间
+  }
 ) {  
   // 创建内部AbortController用于控制操作
   const internalController = new AbortController();
@@ -464,21 +469,161 @@ async Call(
           }
         }
         
-        for await (const chunk of dataSourceCallback()) {
-          // 检查是否已中止
-          if (internalController.signal.aborted) {
-            throw new Error('Operation aborted');
-          }
+        // 动态批量处理逻辑 - 在处理过程中动态补充新数据
+        const batchSize = options?.batchSize || 10;
+        const maxBatchWaitMs = options?.maxBatchWaitMs || 50;
+        
+        // 动态批处理器
+        const processingQueue: {
+          chunk: Uint8Array;
+          resolve: (value: void | PromiseLike<void>) => void;
+          reject: (reason?: any) => void;
+        }[] = [];
+        
+        let isProcessing = false;
+        
+        const processNextBatch = async () => {
+          if (isProcessing || processingQueue.length === 0) return;
+          isProcessing = true;
           
-          const dataFrames = Http2Frame.createDataFrames(streamId, chunk, false);  
-          for (const dataFrame of dataFrames) {
+          let currentBatch: typeof processingQueue = [];
+          
+          try {
+            // 收集当前批次的数据
+            currentBatch = processingQueue.splice(0, Math.min(batchSize, processingQueue.length));
+            
+            if (currentBatch.length > 1) {
+              // 批量处理：为每个chunk创建HTTP/2帧
+              const allFrames: Uint8Array[] = [];
+              
+              for (const item of currentBatch) {
+                const dataFrames = Http2Frame.createDataFrames(streamId, item.chunk, false);
+                allFrames.push(...dataFrames);
+              }
+              
+              // 并发写入所有帧
+              const writePromises = allFrames.map(async (frame) => {
+                if (internalController.signal.aborted) {
+                  throw new Error('Operation aborted');
+                }
+                return writer.write(frame as any);
+              });
+              
+              await Promise.all(writePromises);
+              
+              // 通知所有chunk处理完成
+              currentBatch.forEach(item => item.resolve());
+            } else if (currentBatch.length === 1) {
+              // 单个chunk处理
+              const item = currentBatch[0];
+              const dataFrames = Http2Frame.createDataFrames(streamId, item.chunk, false);
+              
+              const writePromises = dataFrames.map(async (dataFrame) => {
+                if (internalController.signal.aborted) {
+                  throw new Error('Operation aborted');
+                }
+                return writer.write(dataFrame as any);
+              });
+              
+              await Promise.all(writePromises);
+              item.resolve();
+            }
+          } catch (error) {
+            // 处理错误，通知当前批次的所有chunk处理失败
+            currentBatch.forEach(item => {
+              try {
+                item.reject(error);
+              } catch (err) {
+                // 忽略 reject 可能的错误（Promise 已经被处理）
+                console.warn('Error rejecting promise:', err);
+              }
+            });
+          } finally {
+            isProcessing = false;
+            
+            // 如果队列中还有数据，继续处理
+            if (processingQueue.length > 0 && !internalController.signal.aborted) {
+              // 使用 setTimeout 避免阻塞，让新数据有机会加入队列
+              setTimeout(() => processNextBatch(), 0);
+            }
+          }
+        };
+        
+        const addToQueue = (chunk: Uint8Array): Promise<void> => {
+          return new Promise((resolve, reject) => {
+            // 检查是否已经取消
+            if (internalController.signal.aborted) {
+              reject(new Error('Operation aborted'));
+              return;
+            }
+            
+            processingQueue.push({ chunk, resolve, reject });
+            
+            // 如果队列达到批量大小或没有在处理，立即开始处理
+            if (processingQueue.length >= batchSize || !isProcessing) {
+              processNextBatch().catch(err => {
+                console.error('Error in processNextBatch:', err);
+              });
+            }
+          });
+        };
+        
+        // 处理数据源
+        try {
+          for await (const chunkOrChunks of dataSourceCallback()) {
             // 检查是否已中止
             if (internalController.signal.aborted) {
               throw new Error('Operation aborted');
             }
             
-            await writer.write(dataFrame as any);
-          } 
+            // 处理单个chunk或批量chunks
+            const chunksToProcess: Uint8Array[] = Array.isArray(chunkOrChunks) 
+              ? chunkOrChunks 
+              : [chunkOrChunks];
+            
+            // 将所有chunks添加到动态处理队列
+            const addPromises = chunksToProcess.map(chunk => addToQueue(chunk));
+            
+            // 等待当前批次的chunks被添加到队列（不等待处理完成）
+            await Promise.all(addPromises);
+          }
+        } catch (error) {
+          // 取消所有待处理的Promise
+          const remainingQueue = processingQueue.splice(0);
+          remainingQueue.forEach(item => {
+            try {
+              item.reject(error);
+            } catch (err) {
+              console.warn('Error rejecting remaining promise:', err);
+            }
+          });
+          throw error;
+        }
+        
+        // 等待所有剩余的数据处理完成，添加超时保护
+        const queueWaitStart = Date.now();
+        const maxQueueWaitMs = timeout; // 使用主超时时间
+        
+        while (processingQueue.length > 0 || isProcessing) {
+          if (internalController.signal.aborted) {
+            throw new Error('Operation aborted');
+          }
+          
+          // 防止无限等待
+          if (Date.now() - queueWaitStart > maxQueueWaitMs) {
+            // 清理剩余队列
+            const remainingQueue = processingQueue.splice(0);
+            remainingQueue.forEach(item => {
+              try {
+                item.reject(new Error('Queue wait timeout'));
+              } catch (err) {
+                console.warn('Error rejecting timeout promise:', err);
+              }
+            });
+            throw new Error('Queue processing timeout');
+          }
+          
+          await new Promise(resolve => setTimeout(resolve, 10));
         }  
         
         // 检查是否已中止
@@ -530,9 +675,12 @@ async Call(
   
   try {
     // 执行操作并返回取消函数
-    return Promise.race([operationPromise, timeoutPromise])
+    await Promise.race([operationPromise, timeoutPromise]);
+    return cancelOperation;
   } catch (error) {
-    return null;
+    // 确保在出错时也进行清理
+    cancelOperation();
+    throw error;
   }
 }
 
