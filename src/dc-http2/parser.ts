@@ -7,9 +7,15 @@ import { StreamWriter } from "./stream";
 export class HTTP2Parser {
   buffer: Uint8Array;
   settingsAckReceived: boolean;
+  peerSettingsReceived: boolean;
   connectionWindowSize: number;
   streams: Map<number, any>;
   defaultStreamWindowSize: number;
+  // 发送方向（对端的接收窗口）跟踪
+  sendConnWindow: number;
+  sendStreamWindows: Map<number, number>;
+  peerInitialStreamWindow: number;
+  private sendWindowWaiters: Array<() => void>;
   onSettings?: (frameHeader: any) => void;
   onData?: (payload: Uint8Array, frameHeader: any) => void;
   onEnd?: () => void;
@@ -20,12 +26,18 @@ export class HTTP2Parser {
   constructor(writer: StreamWriter) {
     this.buffer = new Uint8Array(0);
     this.settingsAckReceived = false;
+    this.peerSettingsReceived = false;
     // 初始化连接级别的流控制窗口大小（默认值：65,535）
     this.connectionWindowSize = 4 << 20;
     // 存储流的Map
     this.streams = new Map();
     // 默认的流级别初始窗口大小
     this.defaultStreamWindowSize = 4 << 20;
+    // 发送方向窗口（对端接收窗口）默认均为 65535
+    this.sendConnWindow = 65535;
+    this.sendStreamWindows = new Map();
+    this.peerInitialStreamWindow = 65535;
+    this.sendWindowWaiters = [];
     // 结束标志
     this.endFlag = false;
 
@@ -109,6 +121,82 @@ export class HTTP2Parser {
     });
   }
 
+  // 等待接收来自对端的 SETTINGS（非 ACK）
+  waitForPeerSettings(timeoutMs: number = 30000): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (this.peerSettingsReceived) {
+        resolve();
+        return;
+      }
+      const interval = setInterval(() => {
+        if (this.peerSettingsReceived) {
+          clearInterval(interval);
+          clearTimeout(timeout);
+          resolve();
+        }
+      }, 100);
+
+      const timeout = setTimeout(() => {
+        clearInterval(interval);
+        reject(new Error("Peer SETTINGS timeout"));
+      }, timeoutMs);
+    });
+  }
+
+  // 注册我们要发送数据的出站流（用于初始化该流的对端窗口）
+  registerOutboundStream(streamId: number) {
+    if (!this.sendStreamWindows.has(streamId)) {
+      this.sendStreamWindows.set(streamId, this.peerInitialStreamWindow);
+    }
+  }
+
+  // 获取发送窗口
+  getSendWindows(streamId: number) {
+    const s = this.sendStreamWindows.get(streamId) ?? 0;
+    return { conn: this.sendConnWindow, stream: s };
+  }
+
+  // 消耗发送窗口（成功写入 DATA 之后调用）
+  consumeSendWindow(streamId: number, bytes: number) {
+    this.sendConnWindow = Math.max(0, this.sendConnWindow - bytes);
+    const cur = this.sendStreamWindows.get(streamId) ?? 0;
+    this.sendStreamWindows.set(streamId, Math.max(0, cur - bytes));
+  }
+
+  // 等待可用发送窗口（两个窗口都需要 >0）
+  async waitForSendWindow(streamId: number, minBytes: number = 1, timeoutMs: number = 30000): Promise<void> {
+    const start = Date.now();
+    return new Promise((resolve, reject) => {
+      const check = () => {
+        const { conn, stream } = this.getSendWindows(streamId);
+        if (conn >= minBytes && stream >= minBytes) {
+          resolve();
+          return true;
+        }
+        if (Date.now() - start > timeoutMs) {
+          reject(new Error('Send window wait timeout'));
+          return true;
+        }
+        return false;
+      };
+      if (check()) return;
+      const tick = () => {
+        if (!check()) {
+          // 继续等待
+        }
+      };
+      const wake = () => { tick(); };
+      // 简单的等待模型：依赖 WINDOW_UPDATE 到达时调用 wake
+      this.sendWindowWaiters.push(wake);
+      // 同时做一个轻微的轮询，防止错过唤醒
+      const interval = setInterval(() => {
+        if (check()) {
+          clearInterval(interval);
+        }
+      }, 50);
+    });
+  }
+
   // 处理单个帧
   async _handleFrame(frameHeader: Frame, frameData: Uint8Array) {
     switch (frameHeader.type) {
@@ -131,7 +219,8 @@ export class HTTP2Parser {
             settings[id] = value;
             if (id === 4) {
               // SETTINGS_INITIAL_WINDOW_SIZE
-              this.defaultStreamWindowSize = value;
+              this.defaultStreamWindowSize = value; // 我方接收窗口（入站）
+              this.peerInitialStreamWindow = value; // 对端接收窗口（我方发送）
             }
           }
 
@@ -139,6 +228,11 @@ export class HTTP2Parser {
           if (this.onSettings) {
             this.onSettings(frameHeader);
           }
+          // 标记已收到对端 SETTINGS
+          this.peerSettingsReceived = true;
+          // 唤醒等待窗口（以防部分实现通过 SETTINGS 改变有效窗口）
+          const waiters = this.sendWindowWaiters.splice(0);
+          waiters.forEach(fn => { try { fn(); } catch {} });
         }
         break;
 
@@ -203,6 +297,18 @@ export class HTTP2Parser {
           frameData,
           frameHeader.streamId
         );
+        // 更新发送窗口（对端接收窗口）
+        try {
+          const inc = this.parseWindowUpdateFrame(frameData, frameHeader).windowSizeIncrement;
+          if (frameHeader.streamId === 0) {
+            this.sendConnWindow += inc;
+          } else {
+            const cur = this.sendStreamWindows.get(frameHeader.streamId) ?? this.peerInitialStreamWindow;
+            this.sendStreamWindows.set(frameHeader.streamId, cur + inc);
+          }
+          const waiters = this.sendWindowWaiters.splice(0);
+          waiters.forEach(fn => { try { fn(); } catch {} });
+        } catch (e) {}
         break;
       case FRAME_TYPES.PING:
         // 处理PING帧

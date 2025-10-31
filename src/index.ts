@@ -73,7 +73,8 @@ export class Libp2pGrpcClient {
               signal: AbortSignal.timeout(dialTimeout)
             })
         stream = await connection.newStream(this.protocol, {
-          maxOutboundStreams: 10
+          maxOutboundStreams: 10,
+          negotiateFully: false
         })
         const streamId = await this.steamManager.getNextAppLevelStreamId()
         const writer = new StreamWriter(stream.sink, { bufferSize: 16 * 1024 * 1024 })  
@@ -85,6 +86,16 @@ export class Libp2pGrpcClient {
           writer.addEventListener('drain', (e: any) => {
             const d = e?.detail || {};
             console.debug(`[unary stream ${streamId}] drain drained=${d.drained} queue=${d.queueSize}`)
+          })
+          writer.addEventListener('stalled', (e: any) => {
+            const d = e?.detail || {};
+            console.warn(`[unary stream ${streamId}] stalled queue=${d.queueSize} drained=${d.drained} since=${d.sinceMs}ms — sending PING`)
+            try {
+              const payload = new Uint8Array(8);
+              crypto.getRandomValues?.(payload);
+              const ping = Http2Frame.createFrame(0x6, 0x0, 0, payload);
+              writer.write(ping as any);
+            } catch {}
           })
         } catch {}
         const parser = new HTTP2Parser(writer);  
@@ -182,26 +193,22 @@ export class Libp2pGrpcClient {
         // 发送Settings请求
         const settingFrme = Http2Frame.createSettingsFrame()
         await writer.write(settingFrme as any);
-        // 等待 SETTINGS ACK，但设置一个小超时以避免长时间阻塞握手
+        // 等待对端 SETTINGS 或 ACK，择一即可，避免偶发握手竞态
         {
-          let acked = false
+          let progressed = false
           await Promise.race([
-            (async()=>{ await parser.waitForSettingsAck(); acked = true })(),
+            (async()=>{ await parser.waitForPeerSettings(1000); progressed = true })(),
+            (async()=>{ await parser.waitForSettingsAck(); progressed = true })(),
             new Promise<void>(res=>setTimeout(res, 300))
           ])
-          if (!acked) {
-            // 不中断，继续后续流程（部分对端会稍后再发 ACK）
-          }
+          // 即使未等到，也继续；多数实现会随后发送
         }
         // 创建头部帧
         const headerFrame = Http2Frame.createHeadersFrame( streamId,method,true,this.token)
         await writer.write(headerFrame as any);
-        // 创建数据帧
-        const dataFrames = Http2Frame.createDataFrames( streamId,requestData, true)
-        // 发送请求
-        for (const dataFrame of dataFrames) {
-            await writer.write(dataFrame as any);
-        }
+        // 直接按帧大小分片发送（保持与之前一致的稳定路径）
+        const dataFrames = Http2Frame.createDataFrames(streamId, requestData, true)
+        for (const df of dataFrames) { await writer.write(df as any) }
         // 等待responseData 不为空,或超时
         await new Promise((resolve, reject) => {
             const t = setTimeout(() => {
@@ -337,13 +344,13 @@ async Call(
               signal: AbortSignal.timeout(dialTimeout)
             });
      // stream = await connection.newStream(this.protocol);
-       stream = await connection.newStream(this.protocol, {
+        stream = await connection.newStream(this.protocol, {
           maxOutboundStreams: 50,
           signal: AbortSignal.timeout(10000),
-          negotiateFully:false
+          negotiateFully: false
         })
       const streamId = await this.steamManager.getNextAppLevelStreamId();  
-      const writer = new StreamWriter(stream.sink, { bufferSize: 16 * 1024 * 1024 });  
+  const writer = new StreamWriter(stream.sink, { bufferSize: 16 * 1024 * 1024 });  
       try {
         writer.addEventListener('backpressure', (e: any) => {
           const d = e?.detail || {};
@@ -351,6 +358,16 @@ async Call(
         })
         writer.addEventListener('drain', (e: any) => {
           const d = e?.detail || {};
+        })
+        writer.addEventListener('stalled', (e: any) => {
+          const d = e?.detail || {};
+          console.warn(`[stream ${streamId}] stalled queue=${d.queueSize} drained=${d.drained} since=${d.sinceMs}ms — sending PING`)
+          try {
+            const payload = new Uint8Array(8);
+            crypto.getRandomValues?.(payload);
+            const ping = Http2Frame.createFrame(0x6, 0x0, 0, payload);
+            writer.write(ping as any);
+          } catch {}
         })
       } catch {}
       const parser = new HTTP2Parser(writer);  
@@ -442,7 +459,7 @@ async Call(
         throw new Error('Operation aborted');
       }
       
-      // Handshake - send HTTP/2 preface  
+  // Handshake - send HTTP/2 preface  
       const preface = Http2Frame.createPreface();  
       await writer.write(preface as any);
       
@@ -451,7 +468,7 @@ async Call(
         throw new Error('Operation aborted');
       }
 
-      // Send Settings request  
+  // Send Settings request  
       const settingFrame = Http2Frame.createSettingsFrame();  
       await writer.write(settingFrame as any);
       
@@ -460,17 +477,36 @@ async Call(
         throw new Error('Operation aborted');
       }
       
-      // 等待 SETTINGS ACK（对端对我们 SETTINGS 的 ACK），但是限制等待时间，避免因对端延迟 ACK 而长时间卡住
+      // 等待对端 SETTINGS 或 ACK，择一即可，避免偶发握手竞态
       {
-        let acked = false;
+        let progressed = false;
         await Promise.race([
-          (async()=>{ await parser.waitForSettingsAck(); acked = true })(),
+          (async()=>{ await parser.waitForPeerSettings(1000); progressed = true })(),
+          (async()=>{ await parser.waitForSettingsAck(); progressed = true })(),
           new Promise<void>(res=>setTimeout(res, 300))
         ]);
-        if (!acked) {
-          // 不中断，继续流程；多数实现随后会补上 ACK
-        }
+        // 即使未等到，也继续；多数实现会随后发送
       }
+
+      // 发送前的保活：在收到任意帧前，每秒发一次 PING 直到检测到活动
+      let gotActivity = false;
+      const stopPing = () => { gotActivity = true; clearInterval(pingTimer as any); };
+      const pingTimer = setInterval(() => {
+        if (gotActivity || internalController.signal.aborted) return;
+        try {
+          const payload = new Uint8Array(8);
+          crypto.getRandomValues?.(payload);
+          const ping = Http2Frame.createFrame(0x6, 0x0, 0, payload);
+          writer.write(ping as any);
+        } catch {}
+      }, 1000);
+      const markActivity = () => { gotActivity = true; clearInterval(pingTimer as any); };
+  const origOnSettings = parser.onSettings;
+  parser.onSettings = (a?: any) => { try { markActivity(); } catch{}; return origOnSettings?.(a); }
+  const origOnHeaders = parser.onHeaders;
+  parser.onHeaders = (a?: any, b?: any) => { try { markActivity(); } catch{}; return origOnHeaders?.(a, b); }
+  const origOnData = parser.onData;
+  parser.onData = async (a?: any, b?: any) => { try { markActivity(); } catch{}; return (origOnData as any)?.(a, b); }
       
       // 检查是否已中止
       if (internalController.signal.aborted) {
@@ -485,8 +521,9 @@ async Call(
       // Create header frame  
       const headerFrame = Http2Frame.createHeadersFrame(streamId, method, true, this.token);  
       if (mode === 'unary' || mode === 'server-streaming') {  
-        const dataFrames = Http2Frame.createDataFrames(streamId, requestData, true);  
         await writer.write(new Uint8Array([...headerFrame]) as any);  
+        const dfs = Http2Frame.createDataFrames(streamId, requestData, true)
+        for (const df of dfs) { await writer.write(df as any) }
         
         // 检查是否已中止
         if (internalController.signal.aborted) {
@@ -510,15 +547,8 @@ async Call(
         }
         
         if (requestData.length > 0) {
-          const dataFrames = Http2Frame.createDataFrames(streamId, requestData, false); 
-          for (const dataFrame of dataFrames) {
-            // 检查是否已中止
-            if (internalController.signal.aborted) {
-              throw new Error('Operation aborted');
-            }
-
-            await writer.write(dataFrame as any);
-          }
+          const dfs0 = Http2Frame.createDataFrames(streamId, requestData, false)
+          for (const df of dfs0) { await writer.write(df as any) }
         }
         
         // 动态批量处理逻辑 - 在处理过程中动态补充新数据
@@ -546,38 +576,20 @@ async Call(
             
             if (currentBatch.length > 1) {
               // 批量处理：为每个chunk创建HTTP/2帧
-              const allFrames: Uint8Array[] = [];
-              
+              // 顺序按窗口发送每个 chunk（避免跨流窗口互相干扰）
               for (const item of currentBatch) {
-                const dataFrames = Http2Frame.createDataFrames(streamId, item.chunk, false);
-                allFrames.push(...dataFrames);
+                if (internalController.signal.aborted) throw new Error('Operation aborted');
+                const frames = Http2Frame.createDataFrames(streamId, item.chunk, false)
+                for (const f of frames) { await writer.write(f as any) }
               }
-              
-              // 并发写入所有帧
-              const writePromises = allFrames.map(async (frame) => {
-                if (internalController.signal.aborted) {
-                  throw new Error('Operation aborted');
-                }
-                return writer.write(frame as any);
-              });
-              
-              await Promise.all(writePromises);
               
               // 通知所有chunk处理完成
               currentBatch.forEach(item => item.resolve());
             } else if (currentBatch.length === 1) {
               // 单个chunk处理
               const item = currentBatch[0];
-              const dataFrames = Http2Frame.createDataFrames(streamId, item.chunk, false);
-              
-              const writePromises = dataFrames.map(async (dataFrame) => {
-                if (internalController.signal.aborted) {
-                  throw new Error('Operation aborted');
-                }
-                return writer.write(dataFrame as any);
-              });
-              
-              await Promise.all(writePromises);
+              const frames1 = Http2Frame.createDataFrames(streamId, item.chunk, false)
+              for (const f of frames1) { await writer.write(f as any) }
               item.resolve();
             }
           } catch (error) {
@@ -683,8 +695,8 @@ async Call(
           throw new Error('Operation aborted');
         }
         
-  const finalFrame = Http2Frame.createDataFrame(streamId, new Uint8Array(), true);  
-  await writer.write(finalFrame as any);
+  const finalFrame = Http2Frame.createDataFrame(streamId, new Uint8Array(), true)
+  await writer.write(finalFrame as any)
   // 在结束前尽量冲刷内部队列，避免服务器看到部分数据 + context canceled
   try { await (writer as any).flush?.(timeout); } catch {}
   await writer.end();

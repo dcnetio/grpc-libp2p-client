@@ -41,6 +41,10 @@ export class StreamWriter {
   private lastBackpressureCheck = 0  // 添加时间戳缓存  
   private bytesDrained = 0 // 统计下游实际消化的字节数
   private lastDrainEventAt = 0
+  private watchdogTimer: any
+  private stallStartAt = 0
+  private lastBytesDrainedSeen = 0
+  private lastBpWarnAt = 0
 
 
   constructor(  
@@ -70,19 +74,8 @@ export class StreamWriter {
      // 保留原始方法引用  
      basePushable._originalPush = basePushable.push.bind(basePushable) 
         basePushable._originalNext = basePushable.next.bind(basePushable) 
-     basePushable._queueSize = 0  
-    // 重写 next 方法  
-    Object.defineProperty(basePushable, 'next', {  
-        value: async () => {  
-        const result = await basePushable._originalNext();  
-        if (!result.done && result.value) {  
-            basePushable._queueSize -= result.value.byteLength;  
-        }  
-        return result;  
-        },  
-        writable: false,  
-        configurable: false  
-    });  
+   basePushable._queueSize = 0  
+  // 不重写 next，避免影响迭代器语义；在 transform 中于“下游消费后”扣减 _queueSize
      // 安全重写 push 方法  
      Object.defineProperty(basePushable, 'push', {  
        value: (chunk: Uint8Array) => {  
@@ -94,6 +87,7 @@ export class StreamWriter {
      })  
      this.p = basePushable  
     this.startPipeline()  
+    this.startWatchdog()
   }  
 
    
@@ -121,14 +115,7 @@ export class StreamWriter {
     return this.backpressureHistory.reduce((a, b) => a + b, 0) / this.backpressureHistory.length
   }  
 
-  // 在 next() 操作时更新队列大小  
-  private async safeNext() {  
-    const result = await this.p.next()  
-    if (!result.done) {  
-      this.p._queueSize -= result.value?result.value.byteLength : 0
-    }  
-    return result  
-  }  
+  
 
   private handleError(err: Error) {  
     this.dispatchEvent(new CustomEvent('error', { detail: err }))  
@@ -154,16 +141,54 @@ export class StreamWriter {
         // 注意：在 async generator 中，yield 返回后到下一次循环之间，表示下游已经“取走并处理了这个 chunk”，
         // 因此这里统计的 bytesDrained 更接近实际被 sink 消费的字节数
         try {
+          // 在下游消费后再扣减待消费队列，避免误判“next 没取”
+          if ((self.p as any)?._queueSize != null) {
+            (self.p as any)._queueSize = Math.max(0, (self.p as any)._queueSize - chunk.byteLength)
+          }
           self.bytesDrained += chunk.byteLength
           const now = Date.now()
           if (now - self.lastDrainEventAt > 250) { // 每 ~250ms 通知一次，避免频繁
             self.lastDrainEventAt = now
             self.dispatchEvent(new CustomEvent('drain', { detail: { drained: self.bytesDrained, queueSize: self.queueSize } }))
           }
-        } catch {}
+          // 记录本次已消耗字节，用于看门狗判断是否前进
+          self.lastBytesDrainedSeen = self.bytesDrained
+        } catch (err) {
+          //打印错误
+          console.error('Error updating bytesDrained in StreamWriter transform', err)
+
+        }
       }  
     }  
   }  
+
+  // 简单的卡顿看门狗：当队列长期高位且 bytesDrained 无进展时发出 stalled 事件
+  private startWatchdog(intervalMs: number = 500, stallMs: number = 1500) {
+    if (this.watchdogTimer) return
+    this.watchdogTimer = setInterval(() => {
+      if (this.abortController.signal.aborted) return
+      const baseThreshold = this.options.bufferSize! * 0.7
+      const q = this.queueSize
+      const now = Date.now()
+      if (q >= baseThreshold) {
+        if (this.lastBytesDrainedSeen === this.bytesDrained) {
+          if (!this.stallStartAt) this.stallStartAt = now
+          if (now - this.stallStartAt >= stallMs) {
+            this.dispatchEvent(new CustomEvent('stalled', { detail: { queueSize: q, drained: this.bytesDrained, sinceMs: now - this.stallStartAt } }))
+            // 避免持续触发，推进起点
+            this.stallStartAt = now
+          }
+        } else {
+          // 有进展，重置
+          this.stallStartAt = 0
+          this.lastBytesDrainedSeen = this.bytesDrained
+        }
+      } else {
+        // 队列回落，重置
+        this.stallStartAt = 0
+      }
+    }, intervalMs)
+  }
 
   async write(data: ArrayBuffer | Blob | string): Promise<void> {  
     if (this.abortController.signal.aborted) return  
@@ -287,7 +312,11 @@ export class StreamWriter {
     
     // 如果仍然背压但达到最大重试次数，记录警告但继续执行
     if (this.queueSize >= baseThreshold) {
-      console.warn(`Stream writer: High backpressure detected (${this.queueSize} bytes), continuing anyway`)
+      const now = Date.now()
+      if (now - this.lastBpWarnAt > 1000) { // 节流警告
+        this.lastBpWarnAt = now
+        console.warn(`Stream writer: High backpressure detected (${this.queueSize} bytes), continuing anyway`)
+      }
     }
   } 
 
@@ -346,6 +375,7 @@ export class StreamWriter {
     this.p.end()  
     this.abortController.abort()  
     this.writeQueue = []  
+    if (this.watchdogTimer) { clearInterval(this.watchdogTimer); this.watchdogTimer = undefined }
   }  
 
   // 等待内部队列被下游完全消费（用于在结束前确保尽量发送完数据）
