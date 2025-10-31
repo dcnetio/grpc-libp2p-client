@@ -9,6 +9,7 @@ import { HPACK} from './dc-http2/hpack'
 import type { Multiaddr } from '@multiformats/multiaddr';
 
 const dialTimeout = 20000 // 20秒
+const DEFAULT_SEND_WINDOW_TIMEOUT = 15000
 
 
 class StreamManager {  
@@ -35,9 +36,9 @@ class StreamManager {
 export class Libp2pGrpcClient {
     node: Libp2p;
     protocol: string;
-    steamManager: StreamManager;
     peerAddr: Multiaddr;
     token: string;
+  private connectionStreamManagers: WeakMap<object, StreamManager>;
 
 
     constructor(node:Libp2p,peerAddr:Multiaddr,token:string,protocol?:string) {
@@ -48,9 +49,52 @@ export class Libp2pGrpcClient {
         }else{
              this.protocol = '/dc/thread/0.0.1'
         }
-        this.steamManager = new StreamManager()
-        this.token = token
+    this.token = token
+    this.connectionStreamManagers = new WeakMap()
     }  
+
+  private getStreamManagerFor(connection: object): StreamManager {
+    let manager = this.connectionStreamManagers.get(connection)
+    if (!manager) {
+      manager = new StreamManager()
+      this.connectionStreamManagers.set(connection, manager)
+    }
+    return manager
+  }
+
+  private async sendFrameWithFlowControl(
+    parser: HTTP2Parser,
+    streamId: number,
+    frame: Uint8Array,
+    writer: StreamWriter,
+    signal?: AbortSignal,
+    timeoutMs: number = DEFAULT_SEND_WINDOW_TIMEOUT
+  ): Promise<void> {
+    if (signal?.aborted) {
+      throw new Error('Operation aborted')
+    }
+    const payloadLength = Math.max(0, frame.length - 9)
+    if (payloadLength > 0) {
+      const { conn, stream } = parser.getSendWindows(streamId)
+      if (conn < payloadLength || stream < payloadLength) {
+        console.debug(`[stream ${streamId}] waiting for send window: need=${payloadLength} conn=${conn} stream=${stream}`)
+      }
+      try {
+        await parser.waitForSendWindow(streamId, payloadLength, timeoutMs)
+      } catch (err) {
+        console.warn(`[stream ${streamId}] send window wait failed (${(err as Error)?.message ?? err}); continuing best-effort`)
+        const forcedCredit = Math.max(payloadLength, 256 << 10)
+        parser.unsafeForceExtendSendWindow(streamId, forcedCredit)
+      }
+    }
+    if (signal?.aborted) {
+      throw new Error('Operation aborted')
+    }
+    await writer.write(frame as any)
+    if (payloadLength > 0) {
+      parser.consumeSendWindow(streamId, payloadLength)
+    }
+  }
 
     setToken(token:string) {
         this.token = token
@@ -76,7 +120,8 @@ export class Libp2pGrpcClient {
           maxOutboundStreams: 10,
           negotiateFully: false
         })
-        const streamId = await this.steamManager.getNextAppLevelStreamId()
+        const streamManager = this.getStreamManagerFor(connection as object)
+        const streamId = await streamManager.getNextAppLevelStreamId()
         const writer = new StreamWriter(stream.sink, { bufferSize: 16 * 1024 * 1024 })  
         try {
           writer.addEventListener('backpressure', (e: any) => {
@@ -98,7 +143,8 @@ export class Libp2pGrpcClient {
             } catch {}
           })
         } catch {}
-        const parser = new HTTP2Parser(writer);  
+  const parser = new HTTP2Parser(writer);  
+  parser.registerOutboundStream(streamId)
         responseDataExpectedLength  = -1 // 重置期望长度
         responseBuffer = [] // 重置缓冲区
         parser.onData = (payload,frameHeader) => {//接收数据
@@ -208,7 +254,10 @@ export class Libp2pGrpcClient {
         await writer.write(headerFrame as any);
         // 直接按帧大小分片发送（保持与之前一致的稳定路径）
         const dataFrames = Http2Frame.createDataFrames(streamId, requestData, true)
-        for (const df of dataFrames) { await writer.write(df as any) }
+        const frameSendTimeout = timeout > 0 ? timeout : DEFAULT_SEND_WINDOW_TIMEOUT
+        for (const df of dataFrames) {
+          await this.sendFrameWithFlowControl(parser, streamId, df, writer, undefined, frameSendTimeout)
+        }
         // 等待responseData 不为空,或超时
         await new Promise((resolve, reject) => {
             const t = setTimeout(() => {
@@ -349,7 +398,8 @@ async Call(
           signal: AbortSignal.timeout(10000),
           negotiateFully: false
         })
-      const streamId = await this.steamManager.getNextAppLevelStreamId();  
+        const streamManager = this.getStreamManagerFor(connection as object);
+      const streamId = await streamManager.getNextAppLevelStreamId();  
   const writer = new StreamWriter(stream.sink, { bufferSize: 16 * 1024 * 1024 });  
       try {
         writer.addEventListener('backpressure', (e: any) => {
@@ -370,7 +420,9 @@ async Call(
           } catch {}
         })
       } catch {}
-      const parser = new HTTP2Parser(writer);  
+  const parser = new HTTP2Parser(writer);  
+  parser.registerOutboundStream(streamId);
+  const sendWindowTimeout = timeout > 0 ? timeout : DEFAULT_SEND_WINDOW_TIMEOUT;
       
       // 在各个回调中检查是否已中止
       parser.onData = async (payload, frameHeader): Promise<void> => {
@@ -522,21 +574,12 @@ async Call(
       const headerFrame = Http2Frame.createHeadersFrame(streamId, method, true, this.token);  
       if (mode === 'unary' || mode === 'server-streaming') {  
         await writer.write(new Uint8Array([...headerFrame]) as any);  
-        const dfs = Http2Frame.createDataFrames(streamId, requestData, true)
-        for (const df of dfs) { await writer.write(df as any) }
+  const dfs = Http2Frame.createDataFrames(streamId, requestData, true)
+  for (const df of dfs) { await this.sendFrameWithFlowControl(parser, streamId, df, writer, internalController.signal, sendWindowTimeout) }
         
         // 检查是否已中止
         if (internalController.signal.aborted) {
           throw new Error('Operation aborted');
-        }
-        
-        for (const dataFrame of dataFrames) {
-          // 检查是否已中止
-          if (internalController.signal.aborted) {
-            throw new Error('Operation aborted');
-          }
-
-          await writer.write(dataFrame as any);  
         }
       } else if ((mode === 'client-streaming' || mode === 'bidirectional') && dataSourceCallback) {  
         await writer.write(headerFrame as any);
@@ -548,7 +591,7 @@ async Call(
         
         if (requestData.length > 0) {
           const dfs0 = Http2Frame.createDataFrames(streamId, requestData, false)
-          for (const df of dfs0) { await writer.write(df as any) }
+          for (const df of dfs0) { await this.sendFrameWithFlowControl(parser, streamId, df, writer, internalController.signal, sendWindowTimeout) }
         }
         
         // 动态批量处理逻辑 - 在处理过程中动态补充新数据
@@ -580,7 +623,7 @@ async Call(
               for (const item of currentBatch) {
                 if (internalController.signal.aborted) throw new Error('Operation aborted');
                 const frames = Http2Frame.createDataFrames(streamId, item.chunk, false)
-                for (const f of frames) { await writer.write(f as any) }
+                for (const f of frames) { await this.sendFrameWithFlowControl(parser, streamId, f, writer, internalController.signal, sendWindowTimeout) }
               }
               
               // 通知所有chunk处理完成
@@ -589,7 +632,7 @@ async Call(
               // 单个chunk处理
               const item = currentBatch[0];
               const frames1 = Http2Frame.createDataFrames(streamId, item.chunk, false)
-              for (const f of frames1) { await writer.write(f as any) }
+              for (const f of frames1) { await this.sendFrameWithFlowControl(parser, streamId, f, writer, internalController.signal, sendWindowTimeout) }
               item.resolve();
             }
           } catch (error) {
@@ -696,7 +739,7 @@ async Call(
         }
         
   const finalFrame = Http2Frame.createDataFrame(streamId, new Uint8Array(), true)
-  await writer.write(finalFrame as any)
+  await this.sendFrameWithFlowControl(parser, streamId, finalFrame, writer, internalController.signal, sendWindowTimeout)
   // 在结束前尽量冲刷内部队列，避免服务器看到部分数据 + context canceled
   try { await (writer as any).flush?.(timeout); } catch {}
   await writer.end();

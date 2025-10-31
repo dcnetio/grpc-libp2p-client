@@ -85,6 +85,15 @@ export class HTTP2Parser {
     } catch (error) {
       console.error("Error processing stream:", error);
       throw error;
+    } finally {
+      if (!this.endFlag) {
+        this.endFlag = true;
+        try {
+          this.onEnd?.();
+        } catch (err) {
+          console.error("Error during onEnd callback:", err);
+        }
+      }
     }
   }
 
@@ -163,18 +172,42 @@ export class HTTP2Parser {
     this.sendStreamWindows.set(streamId, Math.max(0, cur - bytes));
   }
 
+  // 非标准兜底：在对端未及时发送 WINDOW_UPDATE 时，手动回填窗口额度以避免阻塞
+  unsafeForceExtendSendWindow(streamId: number, bytes: number) {
+    if (bytes <= 0) return;
+    this.sendConnWindow = Math.min(0x7fffffff, this.sendConnWindow + bytes);
+    const cur = this.sendStreamWindows.get(streamId) ?? 0;
+    this.sendStreamWindows.set(streamId, Math.min(0x7fffffff, cur + bytes));
+  }
+
   // 等待可用发送窗口（两个窗口都需要 >0）
   async waitForSendWindow(streamId: number, minBytes: number = 1, timeoutMs: number = 30000): Promise<void> {
     const start = Date.now();
     return new Promise((resolve, reject) => {
+      let interval: NodeJS.Timeout | null = null;
+      let settled = false;
       const check = () => {
         const { conn, stream } = this.getSendWindows(streamId);
         if (conn >= minBytes && stream >= minBytes) {
-          resolve();
+          if (!settled) {
+            settled = true;
+            if (interval) {
+              clearInterval(interval);
+              interval = null;
+            }
+            resolve();
+          }
           return true;
         }
         if (Date.now() - start > timeoutMs) {
-          reject(new Error('Send window wait timeout'));
+          if (!settled) {
+            settled = true;
+            if (interval) {
+              clearInterval(interval);
+              interval = null;
+            }
+            reject(new Error('Send window wait timeout'));
+          }
           return true;
         }
         return false;
@@ -189,9 +222,10 @@ export class HTTP2Parser {
       // 简单的等待模型：依赖 WINDOW_UPDATE 到达时调用 wake
       this.sendWindowWaiters.push(wake);
       // 同时做一个轻微的轮询，防止错过唤醒
-      const interval = setInterval(() => {
-        if (check()) {
+      interval = setInterval(() => {
+        if (check() && interval) {
           clearInterval(interval);
+          interval = null;
         }
       }, 50);
     });
@@ -207,6 +241,7 @@ export class HTTP2Parser {
           //接收到Setting请求,进行解析
           const settingsPayload = frameData.slice(9);
           const settings = {};
+          let initialWindowDelta = 0;
           for (let i = 0; i < settingsPayload.length; i += 6) {
             // 正确解析：2字节ID + 4字节值
             const id = (settingsPayload[i] << 8) | settingsPayload[i + 1];
@@ -220,7 +255,15 @@ export class HTTP2Parser {
             if (id === 4) {
               // SETTINGS_INITIAL_WINDOW_SIZE
               this.defaultStreamWindowSize = value; // 我方接收窗口（入站）
+              initialWindowDelta = value - this.peerInitialStreamWindow;
               this.peerInitialStreamWindow = value; // 对端接收窗口（我方发送）
+            }
+          }
+
+          if (initialWindowDelta !== 0) {
+            for (const [sid, current] of this.sendStreamWindows.entries()) {
+              const updated = Math.max(0, current + initialWindowDelta);
+              this.sendStreamWindows.set(sid, updated);
             }
           }
 
