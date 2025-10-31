@@ -39,6 +39,8 @@ export class StreamWriter {
   private writeQueue: (() => Promise<void>)[] = []  
   private isProcessingQueue = false  
   private lastBackpressureCheck = 0  // 添加时间戳缓存  
+  private bytesDrained = 0 // 统计下游实际消化的字节数
+  private lastDrainEventAt = 0
 
 
   constructor(  
@@ -135,6 +137,7 @@ export class StreamWriter {
 
 
   private startPipeline() {  
+    // 在 sink 之前加入一个轻量 tap，用于统计“已被下游实际消费”的字节数
     pipe(  
       this.p,  
       this.createTransform(),  
@@ -143,9 +146,21 @@ export class StreamWriter {
   }  
 
   private createTransform() {  
+    const self = this;  
     return async function* (source: AsyncIterable<Uint8Array>) {  
       for await (const chunk of source) {  
+        // 将数据交给下游
         yield chunk  
+        // 注意：在 async generator 中，yield 返回后到下一次循环之间，表示下游已经“取走并处理了这个 chunk”，
+        // 因此这里统计的 bytesDrained 更接近实际被 sink 消费的字节数
+        try {
+          self.bytesDrained += chunk.byteLength
+          const now = Date.now()
+          if (now - self.lastDrainEventAt > 250) { // 每 ~250ms 通知一次，避免频繁
+            self.lastDrainEventAt = now
+            self.dispatchEvent(new CustomEvent('drain', { detail: { drained: self.bytesDrained, queueSize: self.queueSize } }))
+          }
+        } catch {}
       }  
     }  
   }  
@@ -332,6 +347,24 @@ export class StreamWriter {
     this.abortController.abort()  
     this.writeQueue = []  
   }  
+
+  // 等待内部队列被下游完全消费（用于在结束前确保尽量发送完数据）
+  // 默认超时 10s，避免无限等待
+  async flush(timeoutMs: number = 10000): Promise<void> {
+    const start = Date.now()
+    // 快速路径
+    if (this.queueSize <= 0 && !this.isProcessingQueue && this.writeQueue.length === 0) return
+    // 轮询等待队列清空
+    while (true) {
+      if (this.abortController.signal.aborted) return
+      if (this.queueSize <= 0 && !this.isProcessingQueue && this.writeQueue.length === 0) return
+      if (Date.now() - start > timeoutMs) {
+        console.warn(`Stream writer: flush timeout with ${this.queueSize} bytes still queued`)
+        return
+      }
+      await new Promise(r => setTimeout(r, 10))
+    }
+  }
 
   // 事件系统  
   private listeners = new Map<string, Function[]>()  

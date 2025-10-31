@@ -6,7 +6,10 @@ import json from '@rollup/plugin-json';
 import terser from '@rollup/plugin-terser';
 
 import dts from 'rollup-plugin-dts';
-import pkg from './package.json' assert { type: 'json' };
+import fs from 'node:fs';
+
+// 兼容较旧 Node 版本，避免 JSON import assertions 导致的语法错误
+const pkg = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
 
 const tsconfig = {
   tsconfig: './tsconfig.json',

@@ -76,7 +76,17 @@ export class Libp2pGrpcClient {
           maxOutboundStreams: 10
         })
         const streamId = await this.steamManager.getNextAppLevelStreamId()
-        const writer = new StreamWriter(stream.sink)  
+        const writer = new StreamWriter(stream.sink, { bufferSize: 16 * 1024 * 1024 })  
+        try {
+          writer.addEventListener('backpressure', (e: any) => {
+            const d = e?.detail || {};
+            console.warn(`[unary stream ${streamId}] backpressure current=${d.currentSize} avg=${d.averageSize} threshold=${d.threshold}`)
+          })
+          writer.addEventListener('drain', (e: any) => {
+            const d = e?.detail || {};
+            console.debug(`[unary stream ${streamId}] drain drained=${d.drained} queue=${d.queueSize}`)
+          })
+        } catch {}
         const parser = new HTTP2Parser(writer);  
         responseDataExpectedLength  = -1 // 重置期望长度
         responseBuffer = [] // 重置缓冲区
@@ -172,7 +182,17 @@ export class Libp2pGrpcClient {
         // 发送Settings请求
         const settingFrme = Http2Frame.createSettingsFrame()
         await writer.write(settingFrme as any);
-        await parser.waitForSettingsAck()
+        // 等待 SETTINGS ACK，但设置一个小超时以避免长时间阻塞握手
+        {
+          let acked = false
+          await Promise.race([
+            (async()=>{ await parser.waitForSettingsAck(); acked = true })(),
+            new Promise<void>(res=>setTimeout(res, 300))
+          ])
+          if (!acked) {
+            // 不中断，继续后续流程（部分对端会稍后再发 ACK）
+          }
+        }
         // 创建头部帧
         const headerFrame = Http2Frame.createHeadersFrame( streamId,method,true,this.token)
         await writer.write(headerFrame as any);
@@ -197,7 +217,8 @@ export class Libp2pGrpcClient {
             }
             checkResponse()
         })
-        await writer.end()
+  try { await (writer as any).flush?.(timeout); } catch {}
+  await writer.end()
     } catch (err) {
         console.error('unaryCall error:', err)
         throw err
@@ -242,6 +263,8 @@ async Call(
   options?: { 
     batchSize?: number;  // 批量处理的大小
     maxBatchWaitMs?: number;  // 等待批量数据的最大时间
+    // 是否为本次调用强制使用新连接（会在拨号前尝试 hangUp 旧连接，并在结束后关闭新连接）
+    freshConnection?: boolean;
   }
 ) {  
   // 创建内部AbortController用于控制操作
@@ -300,12 +323,36 @@ async Call(
         throw new Error('Operation aborted');
       }
       
+      // 如开启 freshConnection，则在拨号前尝试断开现有连接，确保本次使用全新连接（注意：会影响与该节点的其他并发）
+      if (options?.freshConnection) {
+        try {
+          await (this as any).node?.hangUp?.(this.peerAddr as any);
+          console.warn('[Call] hangUp existing connection before dialing due to freshConnection=true');
+        } catch (err) {
+          console.warn('[Call] hangUp failed or not supported, proceeding to dial', err);
+        }
+      }
+
       const connection = await this.node.dial(this.peerAddr,{
               signal: AbortSignal.timeout(dialTimeout)
             });
-      stream = await connection.newStream(this.protocol);
+     // stream = await connection.newStream(this.protocol);
+       stream = await connection.newStream(this.protocol, {
+          maxOutboundStreams: 50,
+          signal: AbortSignal.timeout(10000),
+          negotiateFully:false
+        })
       const streamId = await this.steamManager.getNextAppLevelStreamId();  
-      const writer = new StreamWriter(stream.sink);  
+      const writer = new StreamWriter(stream.sink, { bufferSize: 16 * 1024 * 1024 });  
+      try {
+        writer.addEventListener('backpressure', (e: any) => {
+          const d = e?.detail || {};
+          console.warn(`[stream ${streamId}] backpressure current=${d.currentSize} avg=${d.averageSize} threshold=${d.threshold}`)
+        })
+        writer.addEventListener('drain', (e: any) => {
+          const d = e?.detail || {};
+        })
+      } catch {}
       const parser = new HTTP2Parser(writer);  
       
       // 在各个回调中检查是否已中止
@@ -413,17 +460,22 @@ async Call(
         throw new Error('Operation aborted');
       }
       
-      // Wait for the acknowledgement of SETTINGS  
-      await parser.waitForSettingsAck();
+      // 等待 SETTINGS ACK（对端对我们 SETTINGS 的 ACK），但是限制等待时间，避免因对端延迟 ACK 而长时间卡住
+      {
+        let acked = false;
+        await Promise.race([
+          (async()=>{ await parser.waitForSettingsAck(); acked = true })(),
+          new Promise<void>(res=>setTimeout(res, 300))
+        ]);
+        if (!acked) {
+          // 不中断，继续流程；多数实现随后会补上 ACK
+        }
+      }
       
       // 检查是否已中止
       if (internalController.signal.aborted) {
         throw new Error('Operation aborted');
       }
-      
-      // Send Settings ACK  
-      const ackSettingFrame = Http2Frame.createSettingsAckFrame();  
-      await writer.write(ackSettingFrame as any);
       
       // 检查是否已中止
       if (internalController.signal.aborted) {
@@ -631,9 +683,11 @@ async Call(
           throw new Error('Operation aborted');
         }
         
-        const finalFrame = Http2Frame.createDataFrame(streamId, new Uint8Array(), true);  
-        await writer.write(finalFrame as any);  
-        await writer.end();
+  const finalFrame = Http2Frame.createDataFrame(streamId, new Uint8Array(), true);  
+  await writer.write(finalFrame as any);
+  // 在结束前尽量冲刷内部队列，避免服务器看到部分数据 + context canceled
+  try { await (writer as any).flush?.(timeout); } catch {}
+  await writer.end();
       }
       
       // 检查是否已中止
@@ -669,6 +723,16 @@ async Call(
         } catch (err) {
           console.error('Error closing stream:', err);
         }
+      }
+      // 如果本次强制使用了新连接，结束时尽量关闭它，避免连接泄漏
+      if (options?.freshConnection) {
+        try {
+          // 通过 libp2p 连接管理器关闭到该 peer 的连接
+          const conns = (this as any).node?.getConnections?.(this.peerAddr as any) || [];
+          for (const c of conns) {
+            try { await c.close?.(); } catch {}
+          }
+        } catch {}
       }
     } 
   })();
