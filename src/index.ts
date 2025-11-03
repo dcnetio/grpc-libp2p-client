@@ -3,13 +3,29 @@ import type { Libp2p } from 'libp2p'
 import { HTTP2Parser } from './dc-http2/parser';
 import {StreamWriter} from './dc-http2/stream'
 import { Http2Frame } from './dc-http2/frame';
-import  type { Stream } from '@libp2p/interface';
+import type { Connection, Stream } from '@libp2p/interface';
 import { HPACK} from './dc-http2/hpack'
 
 import type { Multiaddr } from '@multiformats/multiaddr';
 
 const dialTimeout = 20000 // 20秒
 const DEFAULT_SEND_WINDOW_TIMEOUT = 15000
+
+type CallMode = 'unary' | 'server-streaming' | 'client-streaming' | 'bidirectional'
+type TransportProfile = 'flow-control' | 'compatibility'
+
+interface CallOptions {
+  batchSize?: number
+  maxBatchWaitMs?: number
+  freshConnection?: boolean
+  transportProfile?: TransportProfile
+}
+
+interface ConnectionState {
+  activeStreams: number
+  maxConcurrentStreams: number
+  waiters: Array<{ resolve: () => void; reject: (error: Error) => void }>
+}
 
 
 class StreamManager {  
@@ -39,6 +55,8 @@ export class Libp2pGrpcClient {
     peerAddr: Multiaddr;
     token: string;
   private connectionStreamManagers: WeakMap<object, StreamManager>;
+  private connectionStates: WeakMap<object, ConnectionState>;
+    private connectionPool: Map<string, { promise: Promise<Connection>, connection?: Connection }>;
 
 
     constructor(node:Libp2p,peerAddr:Multiaddr,token:string,protocol?:string) {
@@ -50,7 +68,9 @@ export class Libp2pGrpcClient {
              this.protocol = '/dc/thread/0.0.1'
         }
     this.token = token
-    this.connectionStreamManagers = new WeakMap()
+  this.connectionStreamManagers = new WeakMap()
+  this.connectionStates = new WeakMap()
+  this.connectionPool = new Map()
     }  
 
   private getStreamManagerFor(connection: object): StreamManager {
@@ -60,6 +80,102 @@ export class Libp2pGrpcClient {
       this.connectionStreamManagers.set(connection, manager)
     }
     return manager
+  }
+
+  private getConnectionState(connection: object): ConnectionState {
+    let state = this.connectionStates.get(connection)
+    if (!state) {
+      state = {
+        activeStreams: 0,
+        maxConcurrentStreams: Number.POSITIVE_INFINITY,
+        waiters: []
+      }
+      this.connectionStates.set(connection, state)
+    }
+    return state
+  }
+
+  private notifyStreamSlotAvailable(state: ConnectionState) {
+    if (state.waiters.length === 0) {
+      return
+    }
+    while (state.waiters.length > 0 && state.activeStreams < state.maxConcurrentStreams) {
+      const waiter = state.waiters.shift()
+      if (!waiter) break
+      try {
+        waiter.resolve()
+      } catch (err) {
+        console.error('Error resolving stream waiter:', err)
+      }
+    }
+  }
+
+  private rejectStreamWaiters(state: ConnectionState, error: Error) {
+    if (state.waiters.length === 0) {
+      return
+    }
+    const waiters = state.waiters.splice(0)
+    for (const waiter of waiters) {
+      try {
+        waiter.reject(error)
+      } catch (err) {
+        console.error('Error rejecting stream waiter:', err)
+      }
+    }
+  }
+
+  private async waitForStreamSlot(state: ConnectionState, signal?: AbortSignal, timeoutMs: number = dialTimeout): Promise<void> {
+    if (state.maxConcurrentStreams <= 0) {
+      throw new Error('No available HTTP/2 streams: server advertised zero concurrent streams')
+    }
+    if (!Number.isFinite(state.maxConcurrentStreams) || state.activeStreams < state.maxConcurrentStreams) {
+      return
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      let settled = false
+      let timeoutId: ReturnType<typeof setTimeout> | undefined
+      const cleanup = () => {
+        const idx = state.waiters.indexOf(waiter)
+        if (idx >= 0) {
+          state.waiters.splice(idx, 1)
+        }
+        if (timeoutId) {
+          clearTimeout(timeoutId)
+        }
+        if (signal) {
+          signal.removeEventListener('abort', onAbort)
+        }
+      }
+      const waiter = {
+        resolve: () => {
+          if (settled) return
+          settled = true
+          cleanup()
+          resolve()
+        },
+        reject: (err: Error) => {
+          if (settled) return
+          settled = true
+          cleanup()
+          reject(err)
+        }
+      }
+      const onAbort = () => {
+        waiter.reject(new Error('Aborted while waiting for available HTTP/2 stream slot'))
+      }
+      if (signal) {
+        if (signal.aborted) {
+          onAbort()
+          return
+        }
+        signal.addEventListener('abort', onAbort, { once: true })
+      }
+      timeoutId = timeoutMs > 0 ? setTimeout(() => {
+        waiter.reject(new Error('Timed out waiting for available HTTP/2 stream slot'))
+      }, timeoutMs) : undefined
+      state.waiters.push(waiter)
+    })
   }
 
   private async sendFrameWithFlowControl(
@@ -96,6 +212,79 @@ export class Libp2pGrpcClient {
     }
   }
 
+  private async acquireConnection(forceNew: boolean): Promise<Connection> {
+  const key = this.peerAddr.toString()
+    if (!forceNew) {
+      const pooled = this.connectionPool.get(key)
+      if (pooled) {
+        const conn = pooled.connection
+        if (conn) {
+          const status = (conn as any)?.stat?.status?.toLowerCase?.()
+          if (!status || status === 'open') {
+            return conn
+          }
+          this.connectionPool.delete(key)
+        } else {
+          return pooled.promise
+        }
+      }
+    }
+
+    const dialPromise = this.node.dial(this.peerAddr, {
+      signal: AbortSignal.timeout(dialTimeout)
+    })
+      .then(async (conn) => {
+        if (!forceNew) {
+          const poolEntry = this.connectionPool.get(key)
+          if (poolEntry && poolEntry.promise === dialPromise) {
+            poolEntry.connection = conn
+            const removeFromPool = () => {
+              const current = this.connectionPool.get(key)
+              if (current && current.promise === dialPromise) {
+                this.connectionPool.delete(key)
+              }
+            }
+            try {
+              const anyConn = conn as any
+              if (typeof anyConn.addEventListener === 'function') {
+                anyConn.addEventListener('close', removeFromPool, { once: true })
+              } else if (typeof anyConn.once === 'function') {
+                anyConn.once('close', removeFromPool)
+              }
+            } catch {}
+          }
+        }
+        return conn
+      })
+      .catch((err) => {
+        if (!forceNew) {
+          const pooled = this.connectionPool.get(key)
+          if (pooled && pooled.promise === dialPromise) {
+            this.connectionPool.delete(key)
+          }
+        }
+        throw err
+      })
+
+    if (!forceNew) {
+      this.connectionPool.set(key, { promise: dialPromise })
+    }
+
+    return dialPromise
+  }
+
+  private getDefaultTransportProfile(mode: CallMode): TransportProfile {
+    switch (mode) {
+      case 'server-streaming':
+        return 'compatibility'
+      case 'client-streaming':
+      case 'bidirectional':
+        return 'flow-control'
+      default:
+        return 'flow-control'
+    }
+  }
+
     setToken(token:string) {
         this.token = token
     }
@@ -110,12 +299,23 @@ export class Libp2pGrpcClient {
     let exitFlag = false
     let errMsg = ''
     let isResponseComplete = false // 添加标志来标识响应是否完成
+    let connection: Connection | null = null
+    let state: ConnectionState | null = null
+    let streamSlotAcquired = false
     try {
        
        // const stream = await this.node.dialProtocol(this.peerAddr, this.protocol)
-        const connection = await this.node.dial(this.peerAddr,{
-              signal: AbortSignal.timeout(dialTimeout)
-            })
+        connection = await this.acquireConnection(false)
+        const connectionKey = this.peerAddr.toString()
+        state = this.getConnectionState(connection as object)
+        try {
+          await this.waitForStreamSlot(state, undefined, timeout)
+          state.activeStreams += 1
+          streamSlotAcquired = true
+        } catch (err) {
+          console.warn('[unaryCall] waiting for stream slot failed:', err)
+          throw err
+        }
         stream = await connection.newStream(this.protocol, {
           maxOutboundStreams: 10,
           negotiateFully: false
@@ -144,6 +344,24 @@ export class Libp2pGrpcClient {
           })
         } catch {}
   const parser = new HTTP2Parser(writer);  
+        parser.onGoaway = (info) => {
+          console.warn('[unaryCall] GOAWAY received from server', info);
+          this.connectionPool.delete(connectionKey);
+          if (state) {
+            this.rejectStreamWaiters(state, new Error('Connection received GOAWAY'))
+          }
+          try {
+            (connection as any)?.close?.();
+          } catch (err) {
+            console.warn('Error closing connection after GOAWAY:', err);
+          }
+        };
+        parser.onSettingsParsed = (settings) => {
+          if (state && settings.maxConcurrentStreams !== undefined && settings.maxConcurrentStreams > 0) {
+            state.maxConcurrentStreams = settings.maxConcurrentStreams
+            this.notifyStreamSlotAvailable(state)
+          }
+        }
   parser.registerOutboundStream(streamId)
         responseDataExpectedLength  = -1 // 重置期望长度
         responseBuffer = [] // 重置缓冲区
@@ -282,6 +500,10 @@ export class Libp2pGrpcClient {
         if (stream) {
             await stream.close()
         }
+        if (streamSlotAcquired && state) {
+          state.activeStreams = Math.max(0, state.activeStreams - 1)
+          this.notifyStreamSlotAvailable(state)
+        }
     }
     if (exitFlag) {
         throw new Error(errMsg)
@@ -303,30 +525,29 @@ export class Libp2pGrpcClient {
  * @param onEndCallback 结束回调函数
  * @param onErrorCallback 错误回调函数
  * @param context 操作上下文，包含AbortSignal用于取消操作
- * @param options 调用选项
+ * @param options 调用选项（可配置批处理、连接行为以及传输策略）
+ * @param options.transportProfile 传输策略: 'flow-control'（默认，适合上传/双向流）或 'compatibility'（兼容旧逻辑，适合高并发 server-streaming）
  * @returns 取消函数，可随时调用终止操作
  */
 async Call(   
   method: string,  
   requestData: Uint8Array,  
   timeout: number = 30000,  
-  mode: 'unary' | 'server-streaming' | 'client-streaming' | 'bidirectional', 
+  mode: CallMode, 
   onDataCallback: (payload: Uint8Array) => void,  
   dataSourceCallback?: () => AsyncIterable<Uint8Array | Uint8Array[]>,
   onEndCallback?: () => void,  
   onErrorCallback?: (error: unknown) => void,
   context?: { signal?: AbortSignal },
-  options?: { 
-    batchSize?: number;  // 批量处理的大小
-    maxBatchWaitMs?: number;  // 等待批量数据的最大时间
-    // 是否为本次调用强制使用新连接（会在拨号前尝试 hangUp 旧连接，并在结束后关闭新连接）
-    freshConnection?: boolean;
-  }
+  options?: CallOptions
 ) {  
   // 创建内部AbortController用于控制操作
   const internalController = new AbortController();
   let timeoutHandle: any;
   let stream: Stream | null = null;
+
+  const profile: TransportProfile = options?.transportProfile ?? this.getDefaultTransportProfile(mode);
+  const useFlowControl = profile === 'flow-control';
   
   // 取消函数 - 将在最后返回给调用者
   const cancelOperation = () => {
@@ -372,6 +593,10 @@ async Call(
     let messageBuffer = new Uint8Array(0); // 用于累积跨帧的消息数据
     let expectedMessageLength = -1; // 当前消息的期望长度
     const hpack = new HPACK();
+    let connection: Connection | null = null;
+    let connectionKey: string | null = null;
+    let state: ConnectionState | null = null;
+    let streamSlotAcquired = false;
     
     try {
       // 检查是否已经中止
@@ -382,6 +607,7 @@ async Call(
       // 如开启 freshConnection，则在拨号前尝试断开现有连接，确保本次使用全新连接（注意：会影响与该节点的其他并发）
       if (options?.freshConnection) {
         try {
+          this.connectionPool.delete(this.peerAddr.toString())
           await (this as any).node?.hangUp?.(this.peerAddr as any);
           console.warn('[Call] hangUp existing connection before dialing due to freshConnection=true');
         } catch (err) {
@@ -389,10 +615,19 @@ async Call(
         }
       }
 
-      const connection = await this.node.dial(this.peerAddr,{
-              signal: AbortSignal.timeout(dialTimeout)
-            });
-     // stream = await connection.newStream(this.protocol);
+      connection = await this.acquireConnection(Boolean(options?.freshConnection));
+      connectionKey = this.peerAddr.toString();
+      state = this.getConnectionState(connection as object);
+      if (state) {
+        try {
+          await this.waitForStreamSlot(state, internalController.signal, timeout);
+          state.activeStreams += 1;
+          streamSlotAcquired = true;
+        } catch (err) {
+          console.warn('[Call] waiting for stream slot failed:', err);
+          throw err;
+        }
+      }
         stream = await connection.newStream(this.protocol, {
           maxOutboundStreams: 50,
           signal: AbortSignal.timeout(10000),
@@ -420,9 +655,46 @@ async Call(
           } catch {}
         })
       } catch {}
-  const parser = new HTTP2Parser(writer);  
-  parser.registerOutboundStream(streamId);
-  const sendWindowTimeout = timeout > 0 ? timeout : DEFAULT_SEND_WINDOW_TIMEOUT;
+  const parser = new HTTP2Parser(writer, { compatibilityMode: !useFlowControl });
+      parser.onGoaway = (info) => {
+        console.warn('[Call] GOAWAY received from server', info);
+        if (connectionKey) {
+          this.connectionPool.delete(connectionKey);
+        }
+        if (state) {
+          this.rejectStreamWaiters(state, new Error('Connection received GOAWAY'));
+        }
+        try {
+          (connection as any)?.close?.();
+        } catch (err) {
+          console.warn('Error closing connection after GOAWAY:', err);
+        }
+      };
+      parser.onSettingsParsed = (settings) => {
+        if (state && settings.maxConcurrentStreams !== undefined && settings.maxConcurrentStreams > 0) {
+          state.maxConcurrentStreams = settings.maxConcurrentStreams;
+          this.notifyStreamSlotAvailable(state);
+        }
+      };
+      if (useFlowControl) {
+        parser.registerOutboundStream(streamId);
+      }
+      const sendWindowTimeout = timeout > 0 ? timeout : DEFAULT_SEND_WINDOW_TIMEOUT;
+      const writeFrame = async (frame: Uint8Array) => {
+        if (useFlowControl) {
+          await this.sendFrameWithFlowControl(parser, streamId, frame, writer, internalController.signal, sendWindowTimeout);
+        } else {
+          if (internalController.signal.aborted) {
+            throw new Error('Operation aborted');
+          }
+          await writer.write(frame as any);
+        }
+      };
+      const writeDataFrames = async (frames: Uint8Array[]) => {
+        for (const frame of frames) {
+          await writeFrame(frame);
+        }
+      };
       
       // 在各个回调中检查是否已中止
       parser.onData = async (payload, frameHeader): Promise<void> => {
@@ -540,26 +812,6 @@ async Call(
         // 即使未等到，也继续；多数实现会随后发送
       }
 
-      // 发送前的保活：在收到任意帧前，每秒发一次 PING 直到检测到活动
-      let gotActivity = false;
-      const stopPing = () => { gotActivity = true; clearInterval(pingTimer as any); };
-      const pingTimer = setInterval(() => {
-        if (gotActivity || internalController.signal.aborted) return;
-        try {
-          const payload = new Uint8Array(8);
-          crypto.getRandomValues?.(payload);
-          const ping = Http2Frame.createFrame(0x6, 0x0, 0, payload);
-          writer.write(ping as any);
-        } catch {}
-      }, 1000);
-      const markActivity = () => { gotActivity = true; clearInterval(pingTimer as any); };
-  const origOnSettings = parser.onSettings;
-  parser.onSettings = (a?: any) => { try { markActivity(); } catch{}; return origOnSettings?.(a); }
-  const origOnHeaders = parser.onHeaders;
-  parser.onHeaders = (a?: any, b?: any) => { try { markActivity(); } catch{}; return origOnHeaders?.(a, b); }
-  const origOnData = parser.onData;
-  parser.onData = async (a?: any, b?: any) => { try { markActivity(); } catch{}; return (origOnData as any)?.(a, b); }
-      
       // 检查是否已中止
       if (internalController.signal.aborted) {
         throw new Error('Operation aborted');
@@ -575,7 +827,7 @@ async Call(
       if (mode === 'unary' || mode === 'server-streaming') {  
         await writer.write(new Uint8Array([...headerFrame]) as any);  
   const dfs = Http2Frame.createDataFrames(streamId, requestData, true)
-  for (const df of dfs) { await this.sendFrameWithFlowControl(parser, streamId, df, writer, internalController.signal, sendWindowTimeout) }
+  await writeDataFrames(dfs)
         
         // 检查是否已中止
         if (internalController.signal.aborted) {
@@ -591,7 +843,7 @@ async Call(
         
         if (requestData.length > 0) {
           const dfs0 = Http2Frame.createDataFrames(streamId, requestData, false)
-          for (const df of dfs0) { await this.sendFrameWithFlowControl(parser, streamId, df, writer, internalController.signal, sendWindowTimeout) }
+          await writeDataFrames(dfs0)
         }
         
         // 动态批量处理逻辑 - 在处理过程中动态补充新数据
@@ -623,7 +875,7 @@ async Call(
               for (const item of currentBatch) {
                 if (internalController.signal.aborted) throw new Error('Operation aborted');
                 const frames = Http2Frame.createDataFrames(streamId, item.chunk, false)
-                for (const f of frames) { await this.sendFrameWithFlowControl(parser, streamId, f, writer, internalController.signal, sendWindowTimeout) }
+                await writeDataFrames(frames)
               }
               
               // 通知所有chunk处理完成
@@ -632,7 +884,7 @@ async Call(
               // 单个chunk处理
               const item = currentBatch[0];
               const frames1 = Http2Frame.createDataFrames(streamId, item.chunk, false)
-              for (const f of frames1) { await this.sendFrameWithFlowControl(parser, streamId, f, writer, internalController.signal, sendWindowTimeout) }
+              await writeDataFrames(frames1)
               item.resolve();
             }
           } catch (error) {
@@ -739,7 +991,7 @@ async Call(
         }
         
   const finalFrame = Http2Frame.createDataFrame(streamId, new Uint8Array(), true)
-  await this.sendFrameWithFlowControl(parser, streamId, finalFrame, writer, internalController.signal, sendWindowTimeout)
+  await writeFrame(finalFrame)
   // 在结束前尽量冲刷内部队列，避免服务器看到部分数据 + context canceled
   try { await (writer as any).flush?.(timeout); } catch {}
   await writer.end();
@@ -788,6 +1040,10 @@ async Call(
             try { await c.close?.(); } catch {}
           }
         } catch {}
+      }
+      if (streamSlotAcquired && state) {
+        state.activeStreams = Math.max(0, state.activeStreams - 1);
+        this.notifyStreamSlotAvailable(state);
       }
     } 
   })();

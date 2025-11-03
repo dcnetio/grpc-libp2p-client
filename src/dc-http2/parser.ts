@@ -4,6 +4,10 @@ import { FRAME_TYPES, FRAME_FLAGS } from "./types";
 import { Http2Frame } from "./frame";
 import { StreamWriter } from "./stream";
 
+type ParserOptions = {
+  compatibilityMode?: boolean
+}
+
 export class HTTP2Parser {
   buffer: Uint8Array;
   settingsAckReceived: boolean;
@@ -20,10 +24,13 @@ export class HTTP2Parser {
   onData?: (payload: Uint8Array, frameHeader: any) => void;
   onEnd?: () => void;
   onHeaders?: (headers: Uint8Array, frameHeader: any) => void;
+  onGoaway?: (info: { lastStreamId?: number; errorCode?: number }) => void;
+  onSettingsParsed?: (settings: { maxConcurrentStreams?: number; initialWindowSize?: number }) => void;
   endFlag: boolean;
   writer: StreamWriter;
+  private readonly compatibilityMode: boolean;
 
-  constructor(writer: StreamWriter) {
+  constructor(writer: StreamWriter, options?: ParserOptions) {
     this.buffer = new Uint8Array(0);
     this.settingsAckReceived = false;
     this.peerSettingsReceived = false;
@@ -42,6 +49,7 @@ export class HTTP2Parser {
     this.endFlag = false;
 
     this.writer = writer;
+    this.compatibilityMode = options?.compatibilityMode ?? false;
   }
 
   // 持续处理流数据
@@ -86,7 +94,7 @@ export class HTTP2Parser {
       console.error("Error processing stream:", error);
       throw error;
     } finally {
-      if (!this.endFlag) {
+      if (!this.compatibilityMode && !this.endFlag) {
         this.endFlag = true;
         try {
           this.onEnd?.();
@@ -174,6 +182,7 @@ export class HTTP2Parser {
 
   // 非标准兜底：在对端未及时发送 WINDOW_UPDATE 时，手动回填窗口额度以避免阻塞
   unsafeForceExtendSendWindow(streamId: number, bytes: number) {
+    if (this.compatibilityMode) return;
     if (bytes <= 0) return;
     this.sendConnWindow = Math.min(0x7fffffff, this.sendConnWindow + bytes);
     const cur = this.sendStreamWindows.get(streamId) ?? 0;
@@ -240,8 +249,9 @@ export class HTTP2Parser {
         } else {
           //接收到Setting请求,进行解析
           const settingsPayload = frameData.slice(9);
-          const settings = {};
+          const settings: Record<number, number> = {};
           let initialWindowDelta = 0;
+          let maxConcurrentStreams: number | undefined;
           for (let i = 0; i < settingsPayload.length; i += 6) {
             // 正确解析：2字节ID + 4字节值
             const id = (settingsPayload[i] << 8) | settingsPayload[i + 1];
@@ -257,14 +267,32 @@ export class HTTP2Parser {
               this.defaultStreamWindowSize = value; // 我方接收窗口（入站）
               initialWindowDelta = value - this.peerInitialStreamWindow;
               this.peerInitialStreamWindow = value; // 对端接收窗口（我方发送）
+            } else if (id === 3) {
+              // SETTINGS_MAX_CONCURRENT_STREAMS
+              maxConcurrentStreams = value;
             }
           }
 
-          if (initialWindowDelta !== 0) {
+          if (!this.compatibilityMode && initialWindowDelta !== 0) {
             for (const [sid, current] of this.sendStreamWindows.entries()) {
               const updated = Math.max(0, current + initialWindowDelta);
               this.sendStreamWindows.set(sid, updated);
             }
+          }
+
+          try {
+            if (this.onSettingsParsed && (maxConcurrentStreams !== undefined || initialWindowDelta !== 0)) {
+              const payload: { maxConcurrentStreams?: number; initialWindowSize?: number } = {};
+              if (maxConcurrentStreams !== undefined) {
+                payload.maxConcurrentStreams = maxConcurrentStreams;
+              }
+              if (initialWindowDelta !== 0) {
+                payload.initialWindowSize = this.peerInitialStreamWindow;
+              }
+              this.onSettingsParsed(payload);
+            }
+          } catch (err) {
+            console.error('Error handling parsed SETTINGS callback:', err);
           }
 
           //发送ACK
@@ -357,6 +385,34 @@ export class HTTP2Parser {
         // 处理PING帧
         this._handlePingFrame(frameHeader, frameData);
         break;
+      case FRAME_TYPES.GOAWAY: {
+        let info: { lastStreamId?: number; errorCode?: number } | undefined;
+        try {
+          const body = frameData.subarray(9);
+          if (body.length >= 8) {
+            const view = new DataView(body.buffer, body.byteOffset, body.byteLength);
+            const lastStreamId = view.getUint32(0, false) & 0x7fffffff;
+            const errorCode = view.getUint32(4, false);
+            info = { lastStreamId, errorCode };
+            console.warn('[HTTP2] GOAWAY received', info);
+          } else {
+            console.warn('[HTTP2] GOAWAY received');
+            info = {};
+          }
+        } catch {}
+        try {
+          this.onGoaway?.(info ?? {});
+        } catch (err) {
+          console.error('Error during GOAWAY callback:', err);
+        }
+        this.endFlag = true;
+        try {
+          this.onEnd?.();
+        } catch (err) {
+          console.error('Error during GOAWAY onEnd callback:', err);
+        }
+        break;
+      }
 
       // case FRAME_TYPES.PUSH_PROMISE:
       //     // 处理服务器推送承诺帧
