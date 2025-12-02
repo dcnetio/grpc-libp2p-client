@@ -399,6 +399,8 @@ export class Libp2pGrpcClient {
             new Error("Connection received GOAWAY")
           );
         }
+        exitFlag = true;
+        errMsg = `GOAWAY received: code=${info.errorCode}`;
         try {
           (connection as any)?.close?.();
         } catch (err) {
@@ -726,7 +728,7 @@ export class Libp2pGrpcClient {
             await this.waitForStreamSlot(
               state,
               internalController.signal,
-              10000
+              timeout
             );
             state.activeStreams += 1;
             streamSlotAcquired = true;
@@ -782,6 +784,10 @@ export class Libp2pGrpcClient {
               new Error("Connection received GOAWAY")
             );
           }
+          if (onErrorCallback) {
+            onErrorCallback(new Error(`GOAWAY received: code=${info.errorCode}`));
+          }
+          internalController.abort();
           try {
             (connection as any)?.close?.();
           } catch (err) {
