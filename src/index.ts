@@ -372,9 +372,6 @@ export class Libp2pGrpcClient {
         });
         writer.addEventListener("drain", (e: any) => {
           const d = e?.detail || {};
-          console.debug(
-            `[unary stream ${streamId}] drain drained=${d.drained} queue=${d.queueSize}`
-          );
         });
         writer.addEventListener("stalled", (e: any) => {
           const d = e?.detail || {};
