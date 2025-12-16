@@ -38,6 +38,13 @@ export class StreamWriter {
   private isBackpressure = false  
   private writeQueue: (() => Promise<void>)[] = []  
   private isProcessingQueue = false  
+  private lastBackpressureCheck = 0  // 添加时间戳缓存  
+  private bytesDrained = 0 // 统计下游实际消化的字节数
+  private lastDrainEventAt = 0
+  private watchdogTimer: any
+  private stallStartAt = 0
+  private lastBytesDrainedSeen = 0
+  private lastBpWarnAt = 0
 
 
   constructor(  
@@ -67,19 +74,8 @@ export class StreamWriter {
      // 保留原始方法引用  
      basePushable._originalPush = basePushable.push.bind(basePushable) 
         basePushable._originalNext = basePushable.next.bind(basePushable) 
-     basePushable._queueSize = 0  
-    // 重写 next 方法  
-    Object.defineProperty(basePushable, 'next', {  
-        value: async () => {  
-        const result = await basePushable._originalNext();  
-        if (!result.done && result.value) {  
-            basePushable._queueSize -= result.value.byteLength;  
-        }  
-        return result;  
-        },  
-        writable: false,  
-        configurable: false  
-    });  
+   basePushable._queueSize = 0  
+  // 不重写 next，避免影响迭代器语义；在 transform 中于“下游消费后”扣减 _queueSize
      // 安全重写 push 方法  
      Object.defineProperty(basePushable, 'push', {  
        value: (chunk: Uint8Array) => {  
@@ -91,6 +87,7 @@ export class StreamWriter {
      })  
      this.p = basePushable  
     this.startPipeline()  
+    this.startWatchdog()
   }  
 
    
@@ -98,14 +95,27 @@ export class StreamWriter {
     return this.p._queueSize  
   }  
 
-  // 在 next() 操作时更新队列大小  
-  private async safeNext() {  
-    const result = await this.p.next()  
-    if (!result.done) {  
-      this.p._queueSize -= result.value.byteLength  
-    }  
-    return result  
+  // 智能获取平均队列大小
+  private getAverageQueueSize(): number {
+    const now = Date.now()
+    const currentSize = this.queueSize
+    
+    // 每100ms才更新一次历史记录，避免频繁计算
+    if (now - this.lastBackpressureCheck > 100) {
+      if (currentSize > 0) {
+        this.backpressureHistory.push(currentSize)
+        if (this.backpressureHistory.length > 5) { // 减少历史记录大小
+          this.backpressureHistory.shift()
+        }
+      }
+      this.lastBackpressureCheck = now
+    }
+    
+    if (this.backpressureHistory.length === 0) return currentSize
+    return this.backpressureHistory.reduce((a, b) => a + b, 0) / this.backpressureHistory.length
   }  
+
+  
 
   private handleError(err: Error) {  
     this.dispatchEvent(new CustomEvent('error', { detail: err }))  
@@ -114,6 +124,7 @@ export class StreamWriter {
 
 
   private startPipeline() {  
+    // 在 sink 之前加入一个轻量 tap，用于统计“已被下游实际消费”的字节数
     pipe(  
       this.p,  
       this.createTransform(),  
@@ -122,12 +133,62 @@ export class StreamWriter {
   }  
 
   private createTransform() {  
+    const self = this;  
     return async function* (source: AsyncIterable<Uint8Array>) {  
       for await (const chunk of source) {  
+        // 将数据交给下游
         yield chunk  
+        // 注意：在 async generator 中，yield 返回后到下一次循环之间，表示下游已经“取走并处理了这个 chunk”，
+        // 因此这里统计的 bytesDrained 更接近实际被 sink 消费的字节数
+        try {
+          // 在下游消费后再扣减待消费队列，避免误判“next 没取”
+          if ((self.p as any)?._queueSize != null) {
+            (self.p as any)._queueSize = Math.max(0, (self.p as any)._queueSize - chunk.byteLength)
+          }
+          self.bytesDrained += chunk.byteLength
+          const now = Date.now()
+          if (now - self.lastDrainEventAt > 250) { // 每 ~250ms 通知一次，避免频繁
+            self.lastDrainEventAt = now
+            self.dispatchEvent(new CustomEvent('drain', { detail: { drained: self.bytesDrained, queueSize: self.queueSize } }))
+          }
+          // 记录本次已消耗字节，用于看门狗判断是否前进
+          self.lastBytesDrainedSeen = self.bytesDrained
+        } catch (err) {
+          //打印错误
+          console.error('Error updating bytesDrained in StreamWriter transform', err)
+
+        }
       }  
     }  
   }  
+
+  // 简单的卡顿看门狗：当队列长期高位且 bytesDrained 无进展时发出 stalled 事件
+  private startWatchdog(intervalMs: number = 500, stallMs: number = 1500) {
+    if (this.watchdogTimer) return
+    this.watchdogTimer = setInterval(() => {
+      if (this.abortController.signal.aborted) return
+      const baseThreshold = this.options.bufferSize! * 0.7
+      const q = this.queueSize
+      const now = Date.now()
+      if (q >= baseThreshold) {
+        if (this.lastBytesDrainedSeen === this.bytesDrained) {
+          if (!this.stallStartAt) this.stallStartAt = now
+          if (now - this.stallStartAt >= stallMs) {
+            this.dispatchEvent(new CustomEvent('stalled', { detail: { queueSize: q, drained: this.bytesDrained, sinceMs: now - this.stallStartAt } }))
+            // 避免持续触发，推进起点
+            this.stallStartAt = now
+          }
+        } else {
+          // 有进展，重置
+          this.stallStartAt = 0
+          this.lastBytesDrainedSeen = this.bytesDrained
+        }
+      } else {
+        // 队列回落，重置
+        this.stallStartAt = 0
+      }
+    }, intervalMs)
+  }
 
   async write(data: ArrayBuffer | Blob | string): Promise<void> {  
     if (this.abortController.signal.aborted) return  
@@ -167,7 +228,13 @@ export class StreamWriter {
 
   private async retryableWrite(chunk: Uint8Array, attempt = 0): Promise<void> {  
     try {  
-      await this.monitorBackpressure()  
+      // 只在队列大小超过阈值时才检查背压
+      const currentSize = this.queueSize
+      const threshold = this.options.bufferSize! * 0.7
+      
+      if (currentSize > threshold) {
+        await this.monitorBackpressure()  
+      }
       
       await new Promise<void>((resolve, reject) => {  
         try {
@@ -188,59 +255,69 @@ export class StreamWriter {
   }  
 
   private async monitorBackpressure(): Promise<void> {  
-    const checkInterval = 50  
-    const historySize = 10  
-
-    while (true) {  
-        const currentSize = this.queueSize // 空值合并运算符  
-        if (currentSize>0){
-          this.backpressureHistory.push(currentSize)  
-        }
-      if (this.backpressureHistory.length > historySize) {  
-        this.backpressureHistory.shift()  
-      }  
-
-      const avg = this.backpressureHistory.reduce((a, b) => a + b, 0) / historySize  
-      const dynamicThreshold = Math.min(  
-        this.options.bufferSize! * 0.8,   
-        avg * 1.5  
-      )  
-
-      if (currentSize < dynamicThreshold || currentSize === 0 ) {  
-        if (this.isBackpressure) {  
-          this.isBackpressure = false  
-          this.dispatchEvent(new CustomEvent('backpressure', {   
-            detail: {   
-              currentSize,  
-              averageSize: avg,  
-              threshold: dynamicThreshold,  
-              waitingTime: 0  
-            }   
-          }))  
-        }  
-        return  
-      }  
-
-      if (!this.isBackpressure) {  
-        this.isBackpressure = true  
-        this.dispatchEvent(new CustomEvent('backpressure', {   
-          detail: {   
-            currentSize,  
-            averageSize: avg,  
-            threshold: dynamicThreshold,  
-            waitingTime: 0  
-          }   
-        }))  
-      }  
-
-      const waitTime = Math.min(  
-        10,   
-        checkInterval * Math.pow(2, currentSize / dynamicThreshold)  
-      )  
-      await new Promise(r => setTimeout(r, waitTime))  
-
-      if (this.abortController.signal.aborted) break  
-    }  
+    const currentSize = this.queueSize
+    const baseThreshold = this.options.bufferSize! * 0.7  // 降低基础阈值，更早检测
+    const criticalThreshold = this.options.bufferSize! * 0.9  // 临界阈值
+    
+    // 快速路径：无背压时直接返回
+    if (currentSize < baseThreshold) {
+      if (this.isBackpressure) {
+        this.isBackpressure = false
+        this.dispatchBackpressureEvent({
+          currentSize,
+          averageSize: this.getAverageQueueSize(),
+          threshold: baseThreshold,
+          waitingTime: 0
+        })
+      }
+      return
+    }
+    
+    // 进入背压状态
+    if (!this.isBackpressure) {
+      this.isBackpressure = true
+      this.dispatchBackpressureEvent({
+        currentSize,
+        averageSize: this.getAverageQueueSize(),
+        threshold: baseThreshold,
+        waitingTime: 0
+      })
+    }
+    
+    // 智能等待策略
+    const pressure = currentSize / this.options.bufferSize!
+    let waitTime: number
+    
+    if (currentSize >= criticalThreshold) {
+      // 临界状态：长时间等待
+      waitTime = 50 + Math.min(200, pressure * 100)
+    } else {
+      // 轻度背压：短时间等待
+      waitTime = Math.min(20, pressure * 30)
+    }
+    
+    // 使用指数退避，但最多等待3次
+    let retryCount = 0
+    const maxRetries = 3
+    
+    while (this.queueSize >= baseThreshold && retryCount < maxRetries) {
+      if (this.abortController.signal.aborted) break
+      
+      await new Promise(r => setTimeout(r, waitTime))
+      retryCount++
+      
+      // 动态调整等待时间
+      waitTime = Math.min(waitTime * 1.5, 100)
+    }
+    
+    // 如果仍然背压但达到最大重试次数，记录警告但继续执行
+    if (this.queueSize >= baseThreshold) {
+      const now = Date.now()
+      if (now - this.lastBpWarnAt > 1000) { // 节流警告
+        this.lastBpWarnAt = now
+        console.warn(`Stream writer: High backpressure detected (${this.queueSize} bytes), continuing anyway`)
+      }
+    }
   } 
 
 
@@ -259,7 +336,15 @@ export class StreamWriter {
 
     while (this.writeQueue.length > 0) {  
       if (this.abortController.signal.aborted) break  
-      await this.monitorBackpressure()  
+      
+      // 只在队列积压时才检查背压，避免每个任务都检查
+      const currentSize = this.queueSize
+      const threshold = this.options.bufferSize! * 0.5  // 更宽松的阈值
+      
+      if (currentSize > threshold) {
+        await this.monitorBackpressure()  
+      }
+      
       const task = this.writeQueue.shift()!  
       await task()  
     }  
@@ -290,7 +375,26 @@ export class StreamWriter {
     this.p.end()  
     this.abortController.abort()  
     this.writeQueue = []  
+    if (this.watchdogTimer) { clearInterval(this.watchdogTimer); this.watchdogTimer = undefined }
   }  
+
+  // 等待内部队列被下游完全消费（用于在结束前确保尽量发送完数据）
+  // 默认超时 10s，避免无限等待
+  async flush(timeoutMs: number = 10000): Promise<void> {
+    const start = Date.now()
+    // 快速路径
+    if (this.queueSize <= 0 && !this.isProcessingQueue && this.writeQueue.length === 0) return
+    // 轮询等待队列清空
+    while (true) {
+      if (this.abortController.signal.aborted) return
+      if (this.queueSize <= 0 && !this.isProcessingQueue && this.writeQueue.length === 0) return
+      if (Date.now() - start > timeoutMs) {
+        console.warn(`Stream writer: flush timeout with ${this.queueSize} bytes still queued`)
+        return
+      }
+      await new Promise(r => setTimeout(r, 10))
+    }
+  }
 
   // 事件系统  
   private listeners = new Map<string, Function[]>()  
