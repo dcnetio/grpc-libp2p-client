@@ -33,6 +33,11 @@
       "types": "./dist/dc-http2/hpack.d.ts"
     }
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dcnetio/grpc-libp2p-client.git"
+  },
+  "homepage": "https://github.com/dcnetio/grpc-libp2p-client#readme",
   "files": [
     "dist",
     "src"
