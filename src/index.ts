@@ -513,12 +513,20 @@ export class Libp2pGrpcClient {
       parser.onHeaders = (headers, header) => {
         const plainHeaders = hpack.decodeHeaderFields(headers);
         if (plainHeaders.get("grpc-status") === "0") {
+          // 成功状态
+
         } else if (plainHeaders.get("grpc-status") !== undefined) {
           exitFlag = true;
           errMsg = plainHeaders.get("grpc-message") || "gRPC call failed";
         }
       };
-      parser.processStream(stream);
+      try {
+        parser.processStream(stream);
+      }catch (error: unknown) {
+        exitFlag = true;
+        throw error;
+      }
+      
       // 握手
       const preface = Http2Frame.createPreface();
       await writer.write(preface as any);
@@ -764,9 +772,9 @@ export class Libp2pGrpcClient {
               crypto.getRandomValues?.(payload);
               const ping = Http2Frame.createFrame(0x6, 0x0, 0, payload);
               writer.write(ping as any);
-            } catch {}
+            } catch { /* empty */ }
           });
-        } catch {}
+        } catch { /* empty */ }
         const parser = new HTTP2Parser(writer, {
           compatibilityMode: !useFlowControl,
         });
@@ -920,8 +928,15 @@ export class Libp2pGrpcClient {
             }
           }
         };
-
+      try{
         parser.processStream(stream);
+      } catch (error: unknown) {
+        if (onErrorCallback) {
+          onErrorCallback(error);
+        } else {
+          throw error;
+        }
+      }
 
         // 检查是否已中止
         if (internalController.signal.aborted) {
