@@ -4,6 +4,7 @@ import commonjs from '@rollup/plugin-commonjs';
 import typescript from '@rollup/plugin-typescript';
 import json from '@rollup/plugin-json';
 import terser from '@rollup/plugin-terser';
+import { visualizer } from 'rollup-plugin-visualizer';
 
 import dts from 'rollup-plugin-dts';
 import fs from 'node:fs';
@@ -177,7 +178,12 @@ const umdConfigs = [
         ...tsconfig,
         target: 'es5'
       }),
-      terser()
+      terser(),
+      visualizer({
+        filename: 'dist/stats.html',
+        gzipSize: true,
+        brotliSize: true
+      })
     ]
   }
 ];
