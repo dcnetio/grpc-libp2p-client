@@ -54,7 +54,6 @@
   "dependencies": {
     "@libp2p/interface": "^3.1.0",
     "@multiformats/multiaddr": "^13.0.1",
-    "it-pipe": "^3.0.1",
     "it-pushable": "^3.2.3",
     "libp2p": "^3.1.3"
   },
