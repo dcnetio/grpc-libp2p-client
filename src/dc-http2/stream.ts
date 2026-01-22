@@ -1,5 +1,5 @@
-import { pipe } from 'it-pipe'  
 import { pushable, Pushable } from 'it-pushable'  
+import type { Stream } from '@libp2p/interface'
 
 interface StreamWriterOptions {  
   /** 分块大小（默认1MB） */  
@@ -48,7 +48,7 @@ export class StreamWriter {
 
 
   constructor(  
-    private sink: any,  
+    private stream: Stream,  
     private options: StreamWriterOptions = {}  
   ) {  
     
@@ -124,13 +124,21 @@ export class StreamWriter {
 
 
   private startPipeline() {  
-    // 在 sink 之前加入一个轻量 tap，用于统计“已被下游实际消费”的字节数
-    pipe(  
-      this.p,  
-      this.createTransform(),  
-      this.sink  
-    ).catch((err: Error) => this.handleError(err)) // 正确绑定this  
-  }  
+    // libp2p v3: 使用 MessageStream API
+    this.pipeToStream().catch((err: Error) => this.handleError(err))
+  }
+
+  private async pipeToStream() {
+    // createTransform 返回一个转换函数，需要传入源数据
+    for await (const chunk of this.createTransform()(this.p)) {
+      // 使用 stream.send() 发送数据，返回 false 表示需要等待 drain
+      const canContinue = this.stream.send(chunk)
+      if (!canContinue) {
+        // 等待 drain 事件
+        await this.stream.onDrain()
+      }
+    }
+  }
 
   private createTransform() {  
     const self = this;  
@@ -361,12 +369,15 @@ export class StreamWriter {
 
   async end(): Promise<void> {  
     this.p.end()  
-    await this.sink.return?.()  
+    // libp2p v3: 关闭 stream
+    await this.stream.close()
     this.cleanup()  
   }  
 
   abort(reason = 'User aborted') {  
-    this.abortController.abort(reason)  
+    this.abortController.abort(reason)
+    // libp2p v3: 调用 stream.abort() 通知底层 stream
+    this.stream.abort(new Error(reason))
     this.cleanup()  
     this.dispatchEvent(new CustomEvent('abort', { detail: reason }))  
   }  

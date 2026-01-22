@@ -360,7 +360,7 @@ export class Libp2pGrpcClient {
       });
       const streamManager = this.getStreamManagerFor(connection as object);
       const streamId = await streamManager.getNextAppLevelStreamId();
-      const writer = new StreamWriter(stream.sink, {
+      const writer = new StreamWriter(stream, {
         bufferSize: 16 * 1024 * 1024,
       });
       try {
@@ -520,12 +520,14 @@ export class Libp2pGrpcClient {
           errMsg = plainHeaders.get("grpc-message") || "gRPC call failed";
         }
       };
-      try {
-        parser.processStream(stream);
-      }catch (error: unknown) {
+      // 启动后台流处理，捕获任何异步错误
+      parser.processStream(stream).catch((error: unknown) => {
+        console.error('Error in processStream:', error);
         exitFlag = true;
-        throw error;
-      }
+        if (!errMsg) {
+          errMsg = error instanceof Error ? error.message : 'Stream processing failed';
+        }
+      });
       
       // 握手
       const preface = Http2Frame.createPreface();
@@ -749,7 +751,7 @@ export class Libp2pGrpcClient {
         });
         const streamManager = this.getStreamManagerFor(connection as object);
         const streamId = await streamManager.getNextAppLevelStreamId();
-        const writer = new StreamWriter(stream.sink, {
+        const writer = new StreamWriter(stream, {
           bufferSize: 16 * 1024 * 1024,
         });
         try {
@@ -928,15 +930,13 @@ export class Libp2pGrpcClient {
             }
           }
         };
-      try{
-        parser.processStream(stream);
-      } catch (error: unknown) {
+      // 启动后台流处理
+      parser.processStream(stream).catch((error: unknown) => {
+        console.error('Error in processStream:', error);
         if (onErrorCallback) {
           onErrorCallback(error);
-        } else {
-          throw error;
         }
-      }
+      });
 
         // 检查是否已中止
         if (internalController.signal.aborted) {

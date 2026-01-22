@@ -55,45 +55,12 @@ export class HTTP2Parser {
   // 持续处理流数据
   async processStream(stream: Stream) {
     try {
-      for await (const chunk of stream.source) {
-        const newData = chunk.subarray();
-
-        // 累积数据到buffer
-        const newBuffer = new Uint8Array(this.buffer.length + newData.length);
-        newBuffer.set(this.buffer);
-        newBuffer.set(newData, this.buffer.length);
-        this.buffer = newBuffer;
-        // 持续处理所有完整的帧
-        while (this.buffer.length >= 9) {
-          // 判断是否有HTTP/2前导
-          if (this.buffer.length >= 24 && this.isHttp2Preface(this.buffer)) {
-            this.buffer = this.buffer.slice(24);
-            // 发送SETTINGS帧
-            const settingFrame = Http2Frame.createSettingsFrame();
-            this.writer.write(settingFrame as any);
-            break;
-          }
-          const frameHeader = this._parseFrameHeader(this.buffer);
-          const totalFrameLength = 9 + frameHeader.length;
-
-          // 检查是否有完整的帧
-          if (this.buffer.length < totalFrameLength) {
-            break;
-          }
-          // 获取完整帧数据
-          const frameData = this.buffer.slice(0, totalFrameLength);
-
-          // 处理不同类型的帧
-          await this._handleFrame(frameHeader, frameData);
-
-          // 移除已处理的帧
-          this.buffer = this.buffer.slice(totalFrameLength);
-        }
+      // libp2p v3: Stream 实现了 AsyncIterable
+      for await (const chunk of stream) {
+        this._processChunk(chunk);
       }
-    } catch (error) {
-      console.error("Error processing stream:", error);
-      throw error;
-    } finally {
+      
+      // Stream 结束后的清理工作
       if (!this.compatibilityMode && !this.endFlag) {
         this.endFlag = true;
         try {
@@ -102,6 +69,50 @@ export class HTTP2Parser {
           console.error("Error during onEnd callback:", err);
         }
       }
+    } catch (error) {
+      console.error("Error processing stream:", error);
+      throw error;
+    }
+  }
+
+  // 处理单个数据块
+  private _processChunk(chunk: any): void {
+    // chunk 是 Uint8ArrayList 或 Uint8Array
+    const newData = chunk.subarray ? chunk.subarray() : new Uint8Array(chunk);
+
+    // 累积数据到buffer
+    const newBuffer = new Uint8Array(this.buffer.length + newData.length);
+    newBuffer.set(this.buffer);
+    newBuffer.set(newData, this.buffer.length);
+    this.buffer = newBuffer;
+    
+    // 持续处理所有完整的帧
+    while (this.buffer.length >= 9) {
+      // 判断是否有HTTP/2前导
+      if (this.buffer.length >= 24 && this.isHttp2Preface(this.buffer)) {
+        this.buffer = this.buffer.slice(24);
+        // 发送SETTINGS帧
+        const settingFrame = Http2Frame.createSettingsFrame();
+        this.writer.write(settingFrame as any);
+        break;
+      }
+      const frameHeader = this._parseFrameHeader(this.buffer);
+      const totalFrameLength = 9 + frameHeader.length;
+
+      // 检查是否有完整的帧
+      if (this.buffer.length < totalFrameLength) {
+        break;
+      }
+      // 获取完整帧数据
+      const frameData = this.buffer.slice(0, totalFrameLength);
+
+      // 处理不同类型的帧
+      this._handleFrame(frameHeader, frameData).catch((err) => {
+        console.error("Error handling frame:", err);
+      });
+
+      // 移除已处理的帧
+      this.buffer = this.buffer.slice(totalFrameLength);
     }
   }
 
@@ -114,6 +125,11 @@ export class HTTP2Parser {
       if (buffer[i] !== PREFACE[i]) return false;
     }
     return true;
+  }
+
+  // 移除之前的 for await 循环代码
+  private _oldProcessStream_removed() {
+    // 这个方法已被上面的事件驱动实现替代
   }
 
   // 等待SETTINGS ACK
