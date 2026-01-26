@@ -47,10 +47,13 @@ export class StreamWriter {
   private lastBpWarnAt = 0
 
 
+  private log?: { trace?: (...args: any[]) => void }
+
   constructor(  
     private stream: Stream,  
     private options: StreamWriterOptions = {}  
   ) {  
+    this.log = { trace: (...args: any[]) => console.debug('[StreamWriter]', ...args) }
     
     if (options){
         this.options = {  
@@ -131,11 +134,25 @@ export class StreamWriter {
   private async pipeToStream() {
     // createTransform 返回一个转换函数，需要传入源数据
     for await (const chunk of this.createTransform()(this.p)) {
-      // 使用 stream.send() 发送数据，返回 false 表示需要等待 drain
-      const canContinue = this.stream.send(chunk)
-      if (!canContinue) {
-        // 等待 drain 事件
-        await this.stream.onDrain()
+      // Check if stream is aborted before sending
+      if (this.abortController.signal.aborted) {
+        break
+      }
+      
+      try {
+        // 使用 stream.send() 发送数据，返回 false 表示需要等待 drain
+        const canContinue = this.stream.send(chunk)
+        if (!canContinue) {
+          // 等待 drain 事件
+          await this.stream.onDrain()
+        }
+      } catch (err: any) {
+        // Gracefully handle stream closing errors
+        if (err.name === 'StreamStateError' && err.message.includes('closing')) {
+          this.log?.trace?.('Stream is closing, stopping pipeline')
+          break
+        }
+        throw err
       }
     }
   }
@@ -375,9 +392,20 @@ export class StreamWriter {
   }  
 
   abort(reason = 'User aborted') {  
+    if (this.abortController.signal.aborted) {
+      return // Already aborted, prevent multiple abort calls
+    }
+    
     this.abortController.abort(reason)
-    // libp2p v3: 调用 stream.abort() 通知底层 stream
-    this.stream.abort(new Error(reason))
+    
+    try {
+      // libp2p v3: 调用 stream.abort() 通知底层 stream
+      this.stream.abort(new Error(reason))
+    } catch (err) {
+      // Stream may already be closed, ignore the error
+      this.log?.trace?.('Stream abort error (may already be closed):', err)
+    }
+    
     this.cleanup()  
     this.dispatchEvent(new CustomEvent('abort', { detail: reason }))  
   }  
