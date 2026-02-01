@@ -1,4 +1,4 @@
-import type { FrameHeader,Frame,FrameSettingPayload } from './types';
+import type { FrameHeader,Frame,FrameSettingPayload } from './types.js';
 
 
 class FrameEncoder {  

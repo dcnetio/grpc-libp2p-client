@@ -197,11 +197,11 @@ export class HPACK {
         if (huffmanEncoded.length < bytes.length) {
             // 使用Huffman编码
             buffer.push(...this.encodeInteger(huffmanEncoded.length, 7, 0x80));
-            buffer.push(...huffmanEncoded);
+            Array.from(huffmanEncoded).forEach(b => buffer.push(b));
         } else {
             // 不使用Huffman编码
             buffer.push(...this.encodeInteger(bytes.length, 7, 0x00));
-            buffer.push(...bytes);
+            Array.from(bytes).forEach(b => buffer.push(b));
         }
 
         return buffer;

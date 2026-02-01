@@ -1,8 +1,8 @@
-import type { Frame } from "./types";
+import type { Frame } from "./types.js";
 import type { Stream } from "@libp2p/interface";
-import { FRAME_TYPES, FRAME_FLAGS } from "./types";
-import { Http2Frame } from "./frame";
-import { StreamWriter } from "./stream";
+import { FRAME_TYPES, FRAME_FLAGS } from "./types.js";
+import { Http2Frame } from "./frame.js";
+import { StreamWriter } from "./stream.js";
 
 type ParserOptions = {
   compatibilityMode?: boolean
@@ -290,10 +290,10 @@ export class HTTP2Parser {
           }
 
           if (!this.compatibilityMode && initialWindowDelta !== 0) {
-            for (const [sid, current] of this.sendStreamWindows.entries()) {
+            Array.from(this.sendStreamWindows.entries()).forEach(([sid, current]) => {
               const updated = Math.max(0, current + initialWindowDelta);
               this.sendStreamWindows.set(sid, updated);
-            }
+            });
           }
 
           try {

@@ -1,9 +1,9 @@
 import type { Libp2p } from "libp2p";
-import { HTTP2Parser } from "./dc-http2/parser";
-import { StreamWriter } from "./dc-http2/stream";
-import { Http2Frame } from "./dc-http2/frame";
+import { HTTP2Parser } from "./dc-http2/parser.js";
+import { StreamWriter } from "./dc-http2/stream.js";
+import { Http2Frame } from "./dc-http2/frame.js";
 import type { Connection, Stream } from "@libp2p/interface";
-import { HPACK } from "./dc-http2/hpack";
+import { HPACK } from "./dc-http2/hpack.js";
 
 import type { Multiaddr } from "@multiformats/multiaddr";
 
@@ -996,7 +996,7 @@ export class Libp2pGrpcClient {
           this.token
         );
         if (mode === "unary" || mode === "server-streaming") {
-          await writer.write(new Uint8Array([...headerFrame]) as any);
+          await writer.write(headerFrame as any);
           const dfs = Http2Frame.createDataFrames(streamId, requestData, true);
           await writeDataFrames(dfs);
 

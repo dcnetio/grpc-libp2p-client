@@ -1,6 +1,6 @@
-import { HPACK } from './hpack'
-import type {Byte,Frame,FrameSettingPayload} from './types'
-import {FrameEncoder} from './encoder'
+import { HPACK } from './hpack.js'
+import type {Byte,Frame,FrameSettingPayload} from './types.js'
+import {FrameEncoder} from './encoder.js'
 
 const  SETTINGS_PARAMETERS = {  
     HEADER_TABLE_SIZE: 0x1,  

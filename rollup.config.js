@@ -14,7 +14,8 @@ const pkg = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url
 
 const tsconfig = {
   tsconfig: './tsconfig.json',
-  declaration: false
+  declaration: false,
+  declarationMap: false
 };
 
 // 外部依赖（这些将不会被打包进最终文件）
