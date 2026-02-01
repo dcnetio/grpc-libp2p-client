@@ -842,7 +842,7 @@ export class Libp2pGrpcClient {
         };
 
         // 在各个回调中检查是否已中止
-        parser.onData = async (payload: Uint8Array, frameHeader?: { flags: number }): Promise<void> => {
+        parser.onData = async  (payload, frameHeader): Promise<void> => {
           // 检查是否已中止
           if (internalController.signal.aborted) {
             return;
