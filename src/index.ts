@@ -417,7 +417,7 @@ export class Libp2pGrpcClient {
       parser.registerOutboundStream(streamId);
       responseDataExpectedLength = -1; // 重置期望长度
       responseBuffer = []; // 重置缓冲区
-      parser.onData = (payload, frameHeader) => {
+      parser.onData = (payload: Uint8Array, frameHeader?: { flags: number }) => {
         //接收数据
         if (responseDataExpectedLength === -1) {
           //grpc消息头部未读取
@@ -510,7 +510,8 @@ export class Libp2pGrpcClient {
         const ackSettingFrame = Http2Frame.createSettingsAckFrame();
         writer.write(ackSettingFrame as any);
       };
-      parser.onHeaders = (headers, header) => {
+      parser.onHeaders = (headers: Uint8Array, frameHeader:any) => {
+
         const plainHeaders = hpack.decodeHeaderFields(headers);
         if (plainHeaders.get("grpc-status") === "0") {
           // 成功状态
@@ -519,6 +520,7 @@ export class Libp2pGrpcClient {
           exitFlag = true;
           errMsg = plainHeaders.get("grpc-message") || "gRPC call failed";
         }
+        
       };
       // 启动后台流处理，捕获任何异步错误
       parser.processStream(stream).catch((error: unknown) => {
@@ -840,7 +842,7 @@ export class Libp2pGrpcClient {
         };
 
         // 在各个回调中检查是否已中止
-        parser.onData = async (payload, frameHeader): Promise<void> => {
+        parser.onData = async (payload: Uint8Array, frameHeader?: { flags: number }): Promise<void> => {
           // 检查是否已中止
           if (internalController.signal.aborted) {
             return;
@@ -912,7 +914,7 @@ export class Libp2pGrpcClient {
           writer.write(ackSettingFrame as any);
         };
 
-        parser.onHeaders = (headers, header) => {
+        parser.onHeaders = (headers: Uint8Array) => {
           // 检查是否已中止
           if (internalController.signal.aborted) return;
 

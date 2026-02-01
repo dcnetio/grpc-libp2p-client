@@ -11,7 +11,7 @@
     "declaration": true,  
     "declarationMap": true,         // 生成声明文件的映射  
     "sourceMap": true,  
-    // "strict": true,  
+    "strict": true,  
     "skipLibCheck": true,  
     "forceConsistentCasingInFileNames": true,
     "outDir": "./dist",            // 编译输出目录  

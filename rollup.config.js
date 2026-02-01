@@ -8,9 +8,14 @@ import { visualizer } from 'rollup-plugin-visualizer';
 
 import dts from 'rollup-plugin-dts';
 import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 // 兼容较旧 Node 版本，避免 JSON import assertions 导致的语法错误
-const pkg = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
+const pkg = JSON.parse(fs.readFileSync(join(__dirname, 'package.json'), 'utf8'));
 
 const tsconfig = {
   tsconfig: './tsconfig.json',
