@@ -1,5 +1,4 @@
 // HPACK Implementation
-import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
 export class HPACK {
     dynamicTable: [string, string][];
     dynamicTableSize: number;
@@ -507,8 +506,7 @@ export class HPACK {
             }  
         } else {  
             try {  
-            //    result = new TextDecoder().decode(bytes);  
-                result = uint8ArrayToString(bytes);
+                result = new TextDecoder().decode(bytes);  
             } catch (e) {  
                 result = '';  
             }  
