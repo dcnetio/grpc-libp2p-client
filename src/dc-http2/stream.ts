@@ -121,6 +121,11 @@ export class StreamWriter {
   
 
   private handleError(err: Error) {  
+    // 避免重复触发错误处理
+    if (this.abortController.signal.aborted) {
+      return
+    }
+    
     this.dispatchEvent(new CustomEvent('error', { detail: err }))  
     this.abort(err.message)  
   }  
@@ -400,10 +405,16 @@ export class StreamWriter {
     
     try {
       // libp2p v3: 调用 stream.abort() 通知底层 stream
-      this.stream.abort(new Error(reason))
-    } catch (err) {
+      // 先检查流状态，避免在已关闭的流上调用 abort
+      if (this.stream && typeof this.stream.abort === 'function') {
+        this.stream.abort(new Error(reason))
+      }
+    } catch (err: any) {
       // Stream may already be closed, ignore the error
-      this.log?.trace?.('Stream abort error (may already be closed):', err)
+      // 忽略所有流关闭相关的错误
+      if (!err.message?.includes('closed') && !err.message?.includes('closing')) {
+        this.log?.trace?.('Stream abort error:', err)
+      }
     }
     
     this.cleanup()  
@@ -411,7 +422,12 @@ export class StreamWriter {
   }  
 
   private cleanup() {  
-    this.p.end()  
+    try {
+      this.p.end()  
+    } catch (err) {
+      // Ignore errors when ending pushable
+    }
+    
     this.abortController.abort()  
     this.writeQueue = []  
     if (this.watchdogTimer) { clearInterval(this.watchdogTimer); this.watchdogTimer = undefined }
