@@ -334,7 +334,7 @@ export class HTTP2Parser {
           if (frameHeader.streamId !== 0) {
             const streamWindowUpdate = Http2Frame.createWindowUpdateFrame(
               frameHeader.streamId,
-              frameHeader.length
+              frameHeader.length ?? 0
             );
             this.writer.write(streamWindowUpdate as any);
           }
@@ -342,7 +342,7 @@ export class HTTP2Parser {
           // 更新连接级别的窗口
           const connWindowUpdate = Http2Frame.createWindowUpdateFrame(
             0,
-            frameHeader.length
+            frameHeader.length ?? 0
           );
           this.writer.write(connWindowUpdate as any);
         } catch (err) {

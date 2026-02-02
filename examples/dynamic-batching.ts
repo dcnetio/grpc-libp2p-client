@@ -1,4 +1,4 @@
-import { Libp2pGrpcClient } from '../src/index';
+import { Libp2pGrpcClient } from '../src/index.js';
 
 /**
  * 动态批处理示例
