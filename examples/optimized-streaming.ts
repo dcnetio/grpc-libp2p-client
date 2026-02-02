@@ -1,4 +1,4 @@
-import { Libp2pGrpcClient } from '../src/index';
+import { Libp2pGrpcClient } from '../src/index.js';
 
 /**
  * 示例：使用优化后的批量数据源回调
