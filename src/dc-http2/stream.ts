@@ -45,7 +45,7 @@ export class StreamWriter {
   private stallStartAt = 0
   private lastBytesDrainedSeen = 0
   private lastBpWarnAt = 0
-
+  private isHandlingError = false // 防止重复错误处理
 
   private log?: { trace?: (...args: any[]) => void }
 
@@ -53,6 +53,11 @@ export class StreamWriter {
     private stream: Stream,  
     private options: StreamWriterOptions = {}  
   ) {  
+    // 验证 stream 参数
+    if (!stream) {
+      throw new Error('StreamWriter requires a valid stream object')
+    }
+    
     this.log = { trace: (...args: any[]) => console.debug('[StreamWriter]', ...args) }
     
     if (options){
@@ -122,12 +127,22 @@ export class StreamWriter {
 
   private handleError(err: Error) {  
     // 避免重复触发错误处理
-    if (this.abortController.signal.aborted) {
+    if (this.abortController.signal.aborted || this.isHandlingError) {
       return
     }
     
-    this.dispatchEvent(new CustomEvent('error', { detail: err }))  
-    this.abort(err.message)  
+    this.isHandlingError = true
+    
+    // 先 abort（清理资源），再触发事件，避免事件处理器中再次操作已关闭的流
+    this.abort(err.message)
+    
+    // 在 abort 之后触发错误事件，此时流已经安全关闭
+    try {
+      this.dispatchEvent(new CustomEvent('error', { detail: err }))
+    } catch (eventErr) {
+      // 忽略事件处理器中的错误，避免循环
+      this.log?.trace?.('Error in error event handler:', eventErr)
+    }
   }  
 
 
@@ -137,6 +152,12 @@ export class StreamWriter {
   }
 
   private async pipeToStream() {
+    // 检查 stream 是否有效
+    if (!this.stream) {
+      this.log?.trace?.('Stream is null/undefined, cannot start pipeline')
+      return
+    }
+    
     // createTransform 返回一个转换函数，需要传入源数据
     for await (const chunk of this.createTransform()(this.p)) {
       // Check if stream is aborted before sending
@@ -152,9 +173,13 @@ export class StreamWriter {
           await this.stream.onDrain()
         }
       } catch (err: any) {
-        // Gracefully handle stream closing errors
-        if (err.name === 'StreamStateError' && err.message.includes('closing')) {
-          this.log?.trace?.('Stream is closing, stopping pipeline')
+        // Gracefully handle stream closing errors - 不要传递到 handleError
+        const errMsg = err.message?.toLowerCase() || ''
+        if (err.name === 'StreamStateError' || 
+            errMsg.includes('closing') || 
+            errMsg.includes('closed') ||
+            errMsg.includes('write to a stream that is closed')) {
+          this.log?.trace?.('Stream is closing/closed, stopping pipeline')
           break
         }
         throw err
@@ -221,11 +246,19 @@ export class StreamWriter {
   }
 
   async write(data: ArrayBuffer | Blob | string): Promise<void> {  
-    if (this.abortController.signal.aborted) return  
+    // 静默处理 aborted 状态，避免在正常的流关闭场景下抛出错误
+    if (this.abortController.signal.aborted) {
+      return Promise.resolve()
+    }
 
     return new Promise((resolve, reject) => {  
       const task = async () => {  
         try {  
+          // 任务执行时再次检查状态，静默跳过
+          if (this.abortController.signal.aborted) {
+            resolve()
+            return
+          }
           const buffer = await this.convertToBuffer(data)  
           await this.writeChunks(buffer)  
           resolve()  
@@ -257,6 +290,11 @@ export class StreamWriter {
   }  
 
   private async retryableWrite(chunk: Uint8Array, attempt = 0): Promise<void> {  
+    // 在尝试写入前立即检查流状态，避免向已关闭的流写入
+    if (this.abortController.signal.aborted) {
+      throw new Error('Stream is aborted, cannot write')
+    }
+    
     try {  
       // 只在队列大小超过阈值时才检查背压
       const currentSize = this.queueSize
@@ -264,6 +302,11 @@ export class StreamWriter {
       
       if (currentSize > threshold) {
         await this.monitorBackpressure()  
+      }
+      
+      // 再次检查，因为 monitorBackpressure 是异步的
+      if (this.abortController.signal.aborted) {
+        throw new Error('Stream aborted during backpressure monitoring')
       }
       
       await new Promise<void>((resolve, reject) => {  
@@ -392,7 +435,17 @@ export class StreamWriter {
   async end(): Promise<void> {  
     this.p.end()  
     // libp2p v3: 关闭 stream
-    await this.stream.close()
+    if (this.stream && typeof this.stream.close === 'function') {
+      try {
+        await this.stream.close()
+      } catch (err: any) {
+        // 忽略关闭已关闭流的错误
+        const errMsg = err.message?.toLowerCase() || ''
+        if (!errMsg.includes('closed') && !errMsg.includes('closing')) {
+          this.log?.trace?.('Stream close error:', err)
+        }
+      }
+    }
     this.cleanup()  
   }  
 
@@ -407,29 +460,50 @@ export class StreamWriter {
       // libp2p v3: 调用 stream.abort() 通知底层 stream
       // 先检查流状态，避免在已关闭的流上调用 abort
       if (this.stream && typeof this.stream.abort === 'function') {
-        this.stream.abort(new Error(reason))
+        // 检查流的状态，避免操作已关闭的流
+        const streamState = (this.stream as any).status || (this.stream as any).state
+        if (streamState !== 'closed' && streamState !== 'closing') {
+          this.stream.abort(new Error(reason))
+        }
       }
     } catch (err: any) {
-      // Stream may already be closed, ignore the error
-      // 忽略所有流关闭相关的错误
-      if (!err.message?.includes('closed') && !err.message?.includes('closing')) {
+      // Stream may already be closed, ignore all stream-related errors
+      // 完全忽略流操作错误，避免在错误处理中再次抛出错误
+      const errMsg = err.message?.toLowerCase() || ''
+      if (!errMsg.includes('closed') && !errMsg.includes('closing') && !errMsg.includes('write')) {
         this.log?.trace?.('Stream abort error:', err)
       }
     }
     
     this.cleanup()  
-    this.dispatchEvent(new CustomEvent('abort', { detail: reason }))  
+    
+    // 安全地触发 abort 事件
+    try {
+      this.dispatchEvent(new CustomEvent('abort', { detail: reason }))
+    } catch (eventErr) {
+      // 忽略事件处理器错误
+      this.log?.trace?.('Error in abort event handler:', eventErr)
+    }
   }  
 
   private cleanup() {  
+    // 先设置 abort 标志，阻止新的写入
+    if (!this.abortController.signal.aborted) {
+      this.abortController.abort()
+    }
+    
+    // 立即拒绝所有待处理的写入任务，避免它们继续执行
+    const pendingTasks = this.writeQueue.splice(0)
+    pendingTasks.forEach(task => {
+      // 这些任务的 Promise 会在执行时因为检查到 aborted 而被拒绝
+    })
+    
     try {
       this.p.end()  
     } catch (err) {
       // Ignore errors when ending pushable
     }
     
-    this.abortController.abort()  
-    this.writeQueue = []  
     if (this.watchdogTimer) { clearInterval(this.watchdogTimer); this.watchdogTimer = undefined }
   }  
 

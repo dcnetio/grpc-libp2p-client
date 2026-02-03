@@ -7,7 +7,7 @@ import { HPACK } from "./dc-http2/hpack.js";
 
 import type { Multiaddr } from "@multiformats/multiaddr";
 
-const dialTimeout = 20000; // 20秒
+const dialTimeout = 5000; // 5秒
 const DEFAULT_SEND_WINDOW_TIMEOUT = 15000;
 
 type CallMode =
