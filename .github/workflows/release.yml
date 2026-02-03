@@ -4,8 +4,7 @@ on:
   push:
     branches:
       - main
-    paths:
-      - 'package.json'
+  # 移除 paths 限制，让工作流总是运行，由脚本检查版本变化
 
 concurrency:
   group: publish-${{ github.ref }}
