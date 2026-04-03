@@ -154,6 +154,7 @@ export class Libp2pGrpcClient {
 
     await new Promise<void>((resolve, reject) => {
       let settled = false;
+      // eslint-disable-next-line prefer-const
       let timeoutId: ReturnType<typeof setTimeout> | undefined;
       const cleanup = () => {
         const idx = state.waiters.indexOf(waiter);
@@ -239,7 +240,7 @@ export class Libp2pGrpcClient {
     if (signal?.aborted) {
       throw new Error("Operation aborted");
     }
-    await writer.write(frame as any);
+    await writer.write(frame);
     if (payloadLength > 0) {
       parser.consumeSendWindow(streamId, payloadLength);
     }
@@ -252,7 +253,7 @@ export class Libp2pGrpcClient {
       if (pooled) {
         const conn = pooled.connection;
         if (conn) {
-          const status = (conn as any)?.stat?.status?.toLowerCase?.();
+          const status = conn.status;
           if (!status || status === "open") {
             return conn;
           }
@@ -279,15 +280,8 @@ export class Libp2pGrpcClient {
               }
             };
             try {
-              const anyConn = conn as any;
-              if (typeof anyConn.addEventListener === "function") {
-                anyConn.addEventListener("close", removeFromPool, {
-                  once: true,
-                });
-              } else if (typeof anyConn.once === "function") {
-                anyConn.once("close", removeFromPool);
-              }
-            } catch {}
+              conn.addEventListener("close", removeFromPool, { once: true });
+            } catch { /* ignore event listener registration errors */ }
           }
         }
         return conn;
@@ -364,17 +358,17 @@ export class Libp2pGrpcClient {
         bufferSize: 16 * 1024 * 1024,
       });
       try {
-        writer.addEventListener("backpressure", (e: any) => {
-          const d = e?.detail || {};
+        writer.addEventListener("backpressure", (e: CustomEvent) => {
+          const d = e.detail || {};
           console.warn(
             `[unary stream ${streamId}] backpressure current=${d.currentSize} avg=${d.averageSize} threshold=${d.threshold}`
           );
         });
-        writer.addEventListener("drain", (e: any) => {
-          const d = e?.detail || {};
+        writer.addEventListener("drain", () => {
+          // drain event - no action needed
         });
-        writer.addEventListener("stalled", (e: any) => {
-          const d = e?.detail || {};
+        writer.addEventListener("stalled", (e: CustomEvent) => {
+          const d = e.detail || {};
           console.warn(
             `[unary stream ${streamId}] stalled queue=${d.queueSize} drained=${d.drained} since=${d.sinceMs}ms — sending PING`
           );
@@ -382,10 +376,10 @@ export class Libp2pGrpcClient {
             const payload = new Uint8Array(8);
             crypto.getRandomValues?.(payload);
             const ping = Http2Frame.createFrame(0x6, 0x0, 0, payload);
-            writer.write(ping as any);
-          } catch {}
+            writer.write(ping);
+          } catch { /* ignore ping write errors */ }
         });
-      } catch {}
+      } catch { /* ignore addEventListener errors */ }
       const parser = new HTTP2Parser(writer);
       parser.onGoaway = (info) => {
         console.warn("[unaryCall] GOAWAY received from server", info);
@@ -399,7 +393,7 @@ export class Libp2pGrpcClient {
         exitFlag = true;
         errMsg = `GOAWAY received: code=${info.errorCode}`;
         try {
-          (connection as any)?.close?.();
+          connection?.close();
         } catch (err) {
           console.warn("Error closing connection after GOAWAY:", err);
         }
@@ -425,7 +419,6 @@ export class Libp2pGrpcClient {
           if (payload.length < 5) {
             return;
           }
-          const compressionFlag = payload[0]; // 压缩标志
           const lengthBytes = payload.slice(1, 5); // 消息长度的4字节
           responseDataExpectedLength = new DataView(
             lengthBytes.buffer,
@@ -508,19 +501,16 @@ export class Libp2pGrpcClient {
       parser.onSettings = () => {
         //接收settings,反馈ack
         const ackSettingFrame = Http2Frame.createSettingsAckFrame();
-        writer.write(ackSettingFrame as any);
+        writer.write(ackSettingFrame);
       };
-      parser.onHeaders = (headers, header)  => {
-
+      parser.onHeaders = (headers) => {
         const plainHeaders = hpack.decodeHeaderFields(headers);
         if (plainHeaders.get("grpc-status") === "0") {
           // 成功状态
-
         } else if (plainHeaders.get("grpc-status") !== undefined) {
           exitFlag = true;
           errMsg = plainHeaders.get("grpc-message") || "gRPC call failed";
         }
-
       };
       // 启动后台流处理，捕获任何异步错误
       parser.processStream(stream).catch((error: unknown) => {
@@ -533,26 +523,17 @@ export class Libp2pGrpcClient {
       
       // 握手
       const preface = Http2Frame.createPreface();
-      await writer.write(preface as any);
+      await writer.write(preface);
       // 发送Settings请求
       const settingFrme = Http2Frame.createSettingsFrame();
-      await writer.write(settingFrme as any);
+      await writer.write(settingFrme);
       // 等待对端 SETTINGS 或 ACK，择一即可，避免偶发握手竞态
-      {
-        let progressed = false;
-        await Promise.race([
-          (async () => {
-            await parser.waitForPeerSettings(1000);
-            progressed = true;
-          })(),
-          (async () => {
-            await parser.waitForSettingsAck();
-            progressed = true;
-          })(),
-          new Promise<void>((res) => setTimeout(res, 300)),
-        ]);
-        // 即使未等到，也继续；多数实现会随后发送
-      }
+      await Promise.race([
+        parser.waitForPeerSettings(1000),
+        parser.waitForSettingsAck(),
+        new Promise<void>((res) => setTimeout(res, 300)),
+      ]);
+      // 即使未等到，也继续；多数实现会随后发送
       // 创建头部帧
       const headerFrame = Http2Frame.createHeadersFrame(
         streamId,
@@ -560,7 +541,7 @@ export class Libp2pGrpcClient {
         true,
         this.token
       );
-      await writer.write(headerFrame as any);
+      await writer.write(headerFrame);
       // 直接按帧大小分片发送（保持与之前一致的稳定路径）
       const dataFrames = Http2Frame.createDataFrames(
         streamId,
@@ -596,8 +577,8 @@ export class Libp2pGrpcClient {
         checkResponse();
       });
       try {
-        await (writer as any).flush?.(timeout);
-      } catch {}
+        await writer.flush(timeout);
+      } catch { /* ignore flush errors */ }
       await writer.end();
     } catch (err) {
       console.error("unaryCall error:", err);
@@ -649,7 +630,7 @@ export class Libp2pGrpcClient {
   ) {
     // 创建内部AbortController用于控制操作
     const internalController = new AbortController();
-    let timeoutHandle: any;
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
     let stream: Stream | null = null;
 
     const profile: TransportProfile =
@@ -715,7 +696,7 @@ export class Libp2pGrpcClient {
         if (options?.freshConnection) {
           try {
             this.connectionPool.delete(this.peerAddr.toString());
-            await (this as any).node?.hangUp?.(this.peerAddr as any);
+            await this.node.hangUp(this.peerAddr);
             console.warn(
               "[Call] hangUp existing connection before dialing due to freshConnection=true"
             );
@@ -757,17 +738,17 @@ export class Libp2pGrpcClient {
           bufferSize: 16 * 1024 * 1024,
         });
         try {
-          writer.addEventListener("backpressure", (e: any) => {
-            const d = e?.detail || {};
+          writer.addEventListener("backpressure", (e: CustomEvent) => {
+            const d = e.detail || {};
             console.warn(
               `[stream ${streamId}] backpressure current=${d.currentSize} avg=${d.averageSize} threshold=${d.threshold}`
             );
           });
-          writer.addEventListener("drain", (e: any) => {
-            const d = e?.detail || {};
+          writer.addEventListener("drain", () => {
+            // drain event - no action needed
           });
-          writer.addEventListener("stalled", (e: any) => {
-            const d = e?.detail || {};
+          writer.addEventListener("stalled", (e: CustomEvent) => {
+            const d = e.detail || {};
             console.warn(
               `[stream ${streamId}] stalled queue=${d.queueSize} drained=${d.drained} since=${d.sinceMs}ms — sending PING`
             );
@@ -775,10 +756,10 @@ export class Libp2pGrpcClient {
               const payload = new Uint8Array(8);
               crypto.getRandomValues?.(payload);
               const ping = Http2Frame.createFrame(0x6, 0x0, 0, payload);
-              writer.write(ping as any);
-            } catch { /* empty */ }
+              writer.write(ping);
+            } catch { /* ignore ping write errors */ }
           });
-        } catch { /* empty */ }
+        } catch { /* ignore addEventListener errors */ }
         const parser = new HTTP2Parser(writer, {
           compatibilityMode: !useFlowControl,
         });
@@ -798,7 +779,7 @@ export class Libp2pGrpcClient {
           }
           internalController.abort();
           try {
-            (connection as any)?.close?.();
+            connection?.close();
           } catch (err) {
             console.warn("Error closing connection after GOAWAY:", err);
           }
@@ -832,7 +813,7 @@ export class Libp2pGrpcClient {
             if (internalController.signal.aborted) {
               throw new Error("Operation aborted");
             }
-            await writer.write(frame as any);
+            await writer.write(frame);
           }
         };
         const writeDataFrames = async (frames: Uint8Array[]) => {
@@ -842,7 +823,7 @@ export class Libp2pGrpcClient {
         };
 
         // 在各个回调中检查是否已中止
-        parser.onData = async  (payload, frameHeader): Promise<void> => {
+        parser.onData = async  (payload): Promise<void> => {
           // 检查是否已中止
           if (internalController.signal.aborted) {
             return;
@@ -867,7 +848,6 @@ export class Libp2pGrpcClient {
               // 如果还没有读取消息长度，且缓冲区有足够数据
               if (expectedMessageLength === -1 && messageBuffer.length >= 5) {
                 // 读取 gRPC 消息头：1字节压缩标志 + 4字节长度
-                const compressionFlag = messageBuffer[0];
                 const lengthBytes = messageBuffer.slice(1, 5);
                 expectedMessageLength = new DataView(
                   lengthBytes.buffer,
@@ -911,10 +891,10 @@ export class Libp2pGrpcClient {
           if (internalController.signal.aborted) return;
 
           const ackSettingFrame = Http2Frame.createSettingsAckFrame();
-          writer.write(ackSettingFrame as any);
+          writer.write(ackSettingFrame);
         };
 
-        parser.onHeaders = (headers, header) => {
+        parser.onHeaders = (headers) => {
           // 检查是否已中止
           if (internalController.signal.aborted) return;
 
@@ -947,7 +927,7 @@ export class Libp2pGrpcClient {
 
         // Handshake - send HTTP/2 preface
         const preface = Http2Frame.createPreface();
-        await writer.write(preface as any);
+        await writer.write(preface);
 
         // 检查是否已中止
         if (internalController.signal.aborted) {
@@ -956,7 +936,7 @@ export class Libp2pGrpcClient {
 
         // Send Settings request
         const settingFrame = Http2Frame.createSettingsFrame();
-        await writer.write(settingFrame as any);
+        await writer.write(settingFrame);
 
         // 检查是否已中止
         if (internalController.signal.aborted) {
@@ -965,16 +945,9 @@ export class Libp2pGrpcClient {
 
         // 等待对端 SETTINGS 或 ACK，择一即可，避免偶发握手竞态
         {
-          let progressed = false;
           await Promise.race([
-            (async () => {
-              await parser.waitForPeerSettings(1000);
-              progressed = true;
-            })(),
-            (async () => {
-              await parser.waitForSettingsAck();
-              progressed = true;
-            })(),
+            parser.waitForPeerSettings(1000),
+            parser.waitForSettingsAck(),
             new Promise<void>((res) => setTimeout(res, 300)),
           ]);
           // 即使未等到，也继续；多数实现会随后发送
@@ -998,7 +971,7 @@ export class Libp2pGrpcClient {
           this.token
         );
         if (mode === "unary" || mode === "server-streaming") {
-          await writer.write(headerFrame as any);
+          await writer.write(headerFrame);
           const dfs = Http2Frame.createDataFrames(streamId, requestData, true);
           await writeDataFrames(dfs);
 
@@ -1010,7 +983,7 @@ export class Libp2pGrpcClient {
           (mode === "client-streaming" || mode === "bidirectional") &&
           dataSourceCallback
         ) {
-          await writer.write(headerFrame as any);
+          await writer.write(headerFrame);
 
           // 检查是否已中止
           if (internalController.signal.aborted) {
@@ -1028,13 +1001,12 @@ export class Libp2pGrpcClient {
 
           // 动态批量处理逻辑 - 在处理过程中动态补充新数据
           const batchSize = options?.batchSize || 10;
-          const maxBatchWaitMs = options?.maxBatchWaitMs || 50;
 
           // 动态批处理器
           const processingQueue: {
             chunk: Uint8Array;
             resolve: (value: void | PromiseLike<void>) => void;
-            reject: (reason?: any) => void;
+            reject: (reason?: unknown) => void;
           }[] = [];
 
           let isProcessing = false;
@@ -1195,8 +1167,8 @@ export class Libp2pGrpcClient {
           await writeFrame(finalFrame);
           // 在结束前尽量冲刷内部队列，避免服务器看到部分数据 + context canceled
           try {
-            await (writer as any).flush?.(timeout);
-          } catch {}
+            await writer.flush(timeout);
+          } catch { /* ignore flush errors */ }
           await writer.end();
         }
 
@@ -1242,14 +1214,14 @@ export class Libp2pGrpcClient {
         if (options?.freshConnection) {
           try {
             // 通过 libp2p 连接管理器关闭到该 peer 的连接
-            const conns =
-              (this as any).node?.getConnections?.(this.peerAddr as any) || [];
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const conns = (this.node as any).getConnections?.(this.peerAddr as any) || [];
             for (const c of conns) {
               try {
                 await c.close?.();
-              } catch {}
+              } catch { /* ignore close errors */ }
             }
-          } catch {}
+          } catch { /* ignore connection cleanup errors */ }
         }
         if (streamSlotAcquired && state) {
           state.activeStreams = Math.max(0, state.activeStreams - 1);

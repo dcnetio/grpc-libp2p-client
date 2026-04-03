@@ -41,13 +41,13 @@ export class StreamWriter {
   private lastBackpressureCheck = 0  // 添加时间戳缓存  
   private bytesDrained = 0 // 统计下游实际消化的字节数
   private lastDrainEventAt = 0
-  private watchdogTimer: any
+  private watchdogTimer: ReturnType<typeof setInterval> | undefined
   private stallStartAt = 0
   private lastBytesDrainedSeen = 0
   private lastBpWarnAt = 0
   private isHandlingError = false // 防止重复错误处理
 
-  private log?: { trace?: (...args: any[]) => void }
+  private log?: { trace?: (...args: unknown[]) => void }
 
   constructor(  
     private stream: Stream,  
@@ -58,7 +58,7 @@ export class StreamWriter {
       throw new Error('StreamWriter requires a valid stream object')
     }
     
-    this.log = { trace: (...args: any[]) => console.debug('[StreamWriter]', ...args) }
+    this.log = { trace: (...args: unknown[]) => console.debug('[StreamWriter]', ...args) }
     
     if (options){
         this.options = {  
@@ -172,10 +172,10 @@ export class StreamWriter {
           // 等待 drain 事件
           await this.stream.onDrain()
         }
-      } catch (err: any) {
+      } catch (err: unknown) {
         // Gracefully handle stream closing errors - 不要传递到 handleError
-        const errMsg = err.message?.toLowerCase() || ''
-        if (err.name === 'StreamStateError' || 
+        const errMsg = (err instanceof Error ? err.message : '').toLowerCase()
+        if ((err instanceof Error && err.name === 'StreamStateError') || 
             errMsg.includes('closing') || 
             errMsg.includes('closed') ||
             errMsg.includes('write to a stream that is closed')) {
@@ -188,6 +188,7 @@ export class StreamWriter {
   }
 
   private createTransform() {  
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
     const self = this;  
     return async function* (source: AsyncIterable<Uint8Array>) {  
       for await (const chunk of source) {  
@@ -197,8 +198,8 @@ export class StreamWriter {
         // 因此这里统计的 bytesDrained 更接近实际被 sink 消费的字节数
         try {
           // 在下游消费后再扣减待消费队列，避免误判“next 没取”
-          if ((self.p as any)?._queueSize != null) {
-            (self.p as any)._queueSize = Math.max(0, (self.p as any)._queueSize - chunk.byteLength)
+          if (self.p._queueSize != null) {
+            self.p._queueSize = Math.max(0, self.p._queueSize - chunk.byteLength)
           }
           self.bytesDrained += chunk.byteLength
           const now = Date.now()
@@ -245,7 +246,7 @@ export class StreamWriter {
     }, intervalMs)
   }
 
-  async write(data: ArrayBuffer | Blob | string): Promise<void> {  
+  async write(data: ArrayBuffer | Uint8Array | Blob | string): Promise<void> {  
     // 静默处理 aborted 状态，避免在正常的流关闭场景下抛出错误
     if (this.abortController.signal.aborted) {
       return Promise.resolve()
@@ -272,9 +273,10 @@ export class StreamWriter {
     })  
   }  
 
-  private async convertToBuffer(data: ArrayBuffer | Blob | string): Promise<ArrayBuffer> {  
+  private async convertToBuffer(data: ArrayBuffer | Uint8Array | Blob | string): Promise<ArrayBuffer> {  
     if (data instanceof Blob) return data.arrayBuffer()  
-    if (typeof data === 'string') return new TextEncoder().encode(data).buffer  
+    if (typeof data === 'string') return new TextEncoder().encode(data).buffer as ArrayBuffer
+    if (data instanceof Uint8Array) return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer
     return data  
   }  
 
@@ -438,9 +440,9 @@ export class StreamWriter {
     if (this.stream && typeof this.stream.close === 'function') {
       try {
         await this.stream.close()
-      } catch (err: any) {
+      } catch (err: unknown) {
         // 忽略关闭已关闭流的错误
-        const errMsg = err.message?.toLowerCase() || ''
+        const errMsg = (err instanceof Error ? err.message : '').toLowerCase()
         if (!errMsg.includes('closed') && !errMsg.includes('closing')) {
           this.log?.trace?.('Stream close error:', err)
         }
@@ -461,15 +463,16 @@ export class StreamWriter {
       // 先检查流状态，避免在已关闭的流上调用 abort
       if (this.stream && typeof this.stream.abort === 'function') {
         // 检查流的状态，避免操作已关闭的流
-        const streamState = (this.stream as any).status || (this.stream as any).state
+        const streamState = (this.stream as { status?: string; state?: string }).status ||
+                             (this.stream as { status?: string; state?: string }).state
         if (streamState !== 'closed' && streamState !== 'closing') {
           this.stream.abort(new Error(reason))
         }
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       // Stream may already be closed, ignore all stream-related errors
       // 完全忽略流操作错误，避免在错误处理中再次抛出错误
-      const errMsg = err.message?.toLowerCase() || ''
+      const errMsg = (err instanceof Error ? err.message : '').toLowerCase()
       if (!errMsg.includes('closed') && !errMsg.includes('closing') && !errMsg.includes('write')) {
         this.log?.trace?.('Stream abort error:', err)
       }
@@ -494,13 +497,13 @@ export class StreamWriter {
     
     // 立即拒绝所有待处理的写入任务，避免它们继续执行
     const pendingTasks = this.writeQueue.splice(0)
-    pendingTasks.forEach(task => {
+    pendingTasks.forEach(() => {
       // 这些任务的 Promise 会在执行时因为检查到 aborted 而被拒绝
     })
     
     try {
       this.p.end()  
-    } catch (err) {
+    } catch {
       // Ignore errors when ending pushable
     }
     
@@ -526,7 +529,7 @@ export class StreamWriter {
   }
 
   // 事件系统  
-  private listeners = new Map<string, Function[]>()  
+  private listeners = new Map<string, ((event: CustomEvent) => void)[]>()  
   
   addEventListener(type: string, callback: (event: CustomEvent) => void) {  
     const handlers = this.listeners.get(type) || []  

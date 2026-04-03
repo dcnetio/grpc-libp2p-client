@@ -10,7 +10,7 @@ type Frame = {
     type: Byte;
     flags: Byte;
     streamId: number;
-    payload?: any;
+    payload?: unknown;
 }
 
 type FrameSettingPayload = { identifier: number; value: number }[]

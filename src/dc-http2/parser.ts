@@ -8,22 +8,24 @@ type ParserOptions = {
   compatibilityMode?: boolean
 }
 
+const HTTP2_PREFACE = new TextEncoder().encode("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+
 export class HTTP2Parser {
   buffer: Uint8Array;
   settingsAckReceived: boolean;
   peerSettingsReceived: boolean;
   connectionWindowSize: number;
-  streams: Map<number, any>;
+  streams: Map<number, unknown>;
   defaultStreamWindowSize: number;
   // 发送方向（对端的接收窗口）跟踪
   sendConnWindow: number;
   sendStreamWindows: Map<number, number>;
   peerInitialStreamWindow: number;
   private sendWindowWaiters: Array<() => void>;
-  onSettings?: (frameHeader: any) => void;
-  onData?: (payload: Uint8Array, frameHeader: any) => void;
+  onSettings?: (frameHeader: Frame) => void;
+  onData?: (payload: Uint8Array, frameHeader: Frame) => void;
   onEnd?: () => void;
-  onHeaders?: (headers: Uint8Array, frameHeader: any) => void;
+  onHeaders?: (headers: Uint8Array, frameHeader: Frame) => void;
   onGoaway?: (info: { lastStreamId?: number; errorCode?: number }) => void;
   onSettingsParsed?: (settings: { maxConcurrentStreams?: number; initialWindowSize?: number }) => void;
   endFlag: boolean;
@@ -76,53 +78,58 @@ export class HTTP2Parser {
   }
 
   // 处理单个数据块
-  private _processChunk(chunk: any): void {
+  private _processChunk(chunk: Uint8Array | { subarray(): Uint8Array }): void {
     // chunk 是 Uint8ArrayList 或 Uint8Array
-    const newData = chunk.subarray ? chunk.subarray() : new Uint8Array(chunk);
-
-    // 累积数据到buffer
+    const newData: Uint8Array = 'subarray' in chunk && typeof chunk.subarray === 'function'
+      ? chunk.subarray()
+      : (chunk as Uint8Array);
+    
+    // 原作者之前的 O(N) 内存拷贝优化被保留，去掉了存在 onEnd 竞态的 setTimeout
     const newBuffer = new Uint8Array(this.buffer.length + newData.length);
     newBuffer.set(this.buffer);
     newBuffer.set(newData, this.buffer.length);
     this.buffer = newBuffer;
-    
+
     // 持续处理所有完整的帧
-    while (this.buffer.length >= 9) {
+    let readOffset = 0;
+    while (this.buffer.length - readOffset >= 9) {
       // 判断是否有HTTP/2前导
-      if (this.buffer.length >= 24 && this.isHttp2Preface(this.buffer)) {
-        this.buffer = this.buffer.slice(24);
+      if (this.buffer.length - readOffset >= 24 && this.isHttp2Preface(this.buffer.subarray(readOffset))) {
+        readOffset += 24;
         // 发送SETTINGS帧
         const settingFrame = Http2Frame.createSettingsFrame();
-        this.writer.write(settingFrame as any);
-        break;
+        this.writer.write(settingFrame);
+        continue;
       }
-      const frameHeader = this._parseFrameHeader(this.buffer);
+      
+      const frameHeader = this._parseFrameHeader(this.buffer.subarray(readOffset));
       const totalFrameLength = 9 + frameHeader.length;
 
       // 检查是否有完整的帧
-      if (this.buffer.length < totalFrameLength) {
+      if (this.buffer.length - readOffset < totalFrameLength) {
         break;
       }
       // 获取完整帧数据
-      const frameData = this.buffer.slice(0, totalFrameLength);
+      const frameData = this.buffer.subarray(readOffset, readOffset + totalFrameLength);
 
       // 处理不同类型的帧
       this._handleFrame(frameHeader, frameData).catch((err) => {
         console.error("Error handling frame:", err);
       });
 
-      // 移除已处理的帧
-      this.buffer = this.buffer.slice(totalFrameLength);
+      // 移动偏移量
+      readOffset += totalFrameLength;
+    }
+    
+    if (readOffset > 0) {
+      this.buffer = this.buffer.slice(readOffset);
     }
   }
 
   private isHttp2Preface(buffer: Uint8Array): boolean {
-    const PREFACE = new TextEncoder().encode(
-      "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
-    );
-    if (buffer.length < PREFACE.length) return false;
-    for (let i = 0; i < PREFACE.length; i++) {
-      if (buffer[i] !== PREFACE[i]) return false;
+    if (buffer.length < HTTP2_PREFACE.length) return false;
+    for (let i = 0; i < HTTP2_PREFACE.length; i++) {
+      if (buffer[i] !== HTTP2_PREFACE[i]) return false;
     }
     return true;
   }
@@ -209,7 +216,7 @@ export class HTTP2Parser {
   async waitForSendWindow(streamId: number, minBytes: number = 1, timeoutMs: number = 30000): Promise<void> {
     const start = Date.now();
     return new Promise((resolve, reject) => {
-      let interval: NodeJS.Timeout | null = null;
+      let interval: ReturnType<typeof setInterval> | null = null;
       let settled = false;
       const check = () => {
         const { conn, stream } = this.getSendWindows(streamId);
@@ -319,7 +326,7 @@ export class HTTP2Parser {
           this.peerSettingsReceived = true;
           // 唤醒等待窗口（以防部分实现通过 SETTINGS 改变有效窗口）
           const waiters = this.sendWindowWaiters.splice(0);
-          waiters.forEach(fn => { try { fn(); } catch {} });
+          waiters.forEach(fn => { try { fn(); } catch (e) { console.debug('waiter error', e); } });
         }
         break;
 
@@ -336,7 +343,7 @@ export class HTTP2Parser {
               frameHeader.streamId,
               frameHeader.length ?? 0
             );
-            this.writer.write(streamWindowUpdate as any);
+            this.writer.write(streamWindowUpdate);
           }
 
           // 更新连接级别的窗口
@@ -344,7 +351,7 @@ export class HTTP2Parser {
             0,
             frameHeader.length ?? 0
           );
-          this.writer.write(connWindowUpdate as any);
+          this.writer.write(connWindowUpdate);
         } catch (err) {
           console.error("[HTTP2] Error sending window update:", err);
         }
@@ -381,8 +388,7 @@ export class HTTP2Parser {
         // 处理窗口更新帧
         this.handleWindowUpdateFrame(
           frameHeader,
-          frameData,
-          frameHeader.streamId
+          frameData
         );
         // 更新发送窗口（对端接收窗口）
         try {
@@ -394,8 +400,8 @@ export class HTTP2Parser {
             this.sendStreamWindows.set(frameHeader.streamId, cur + inc);
           }
           const waiters = this.sendWindowWaiters.splice(0);
-          waiters.forEach(fn => { try { fn(); } catch {} });
-        } catch (e) {}
+          waiters.forEach(fn => { try { fn(); } catch (e) { console.debug('waiter error', e); } });
+        } catch { /* ignore WINDOW_UPDATE parse errors */ }
         break;
       case FRAME_TYPES.PING:
         // 处理PING帧
@@ -415,7 +421,7 @@ export class HTTP2Parser {
             console.warn('[HTTP2] GOAWAY received');
             info = {};
           }
-        } catch {}
+        } catch { /* ignore GOAWAY parse errors */ }
         try {
           this.onGoaway?.(info ?? {});
         } catch (err) {
@@ -473,7 +479,7 @@ export class HTTP2Parser {
     // 反馈PONG帧
     const pongFrame = Http2Frame.createPongFrame(frameData.slice(9));
     try {
-      this.writer.write(pongFrame as any);
+      this.writer.write(pongFrame);
     } catch (error) {
       console.error("Error sending PONG frame:", error);
       throw error;
@@ -489,7 +495,7 @@ export class HTTP2Parser {
         return;
       }
       // 如果是0 ,则不设置超时
-      let timeout: NodeJS.Timeout | null = null;
+      let timeout: ReturnType<typeof setTimeout> | null = null;
       if (waitTime > 0) {
         timeout = setTimeout(() => {
           clearInterval(interval);
@@ -561,8 +567,7 @@ export class HTTP2Parser {
   // 处理 WINDOW_UPDATE 帧
   handleWindowUpdateFrame(
     frameHeader: Frame,
-    payload: Uint8Array,
-    streamId: number
+    payload: Uint8Array
   ) {
     try {
       const windowUpdate = this.parseWindowUpdateFrame(payload, frameHeader);

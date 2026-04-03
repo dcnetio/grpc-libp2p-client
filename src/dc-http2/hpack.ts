@@ -392,7 +392,7 @@ export class HPACK {
     }  
     // Huffman编码实现  
     huffmanEncode(bytes: Uint8Array) {  
-        let result : number[] = [];  
+        const result : number[] = [];  
         let current = 0;  
         let bits = 0;  
 
@@ -501,13 +501,13 @@ export class HPACK {
             
             try {  
                 result = this.decode(bytes);
-            } catch (e) {  
+            } catch {  
                 result = '';  
             }  
         } else {  
             try {  
                 result = new TextDecoder().decode(bytes);  
-            } catch (e) {  
+            } catch {  
                 result = '';  
             }  
         }  

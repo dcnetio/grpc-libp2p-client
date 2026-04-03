@@ -5,7 +5,8 @@ class FrameEncoder {
     // 编码SETTINGS帧  
    static encodeSettingsFrame(frame:Frame):Uint8Array {  
        // 计算payload总长度：每个设置项占6字节  
-       const payloadLength = frame.payload.length * 6;  
+       const settingsPayload = frame.payload as FrameSettingPayload;
+       const payloadLength = settingsPayload.length * 6;  
        // 分配缓冲区：9字节头部 + payload长度  
        const buffer = new Uint8Array(9 + payloadLength); 
        // 编码帧头部（前9个字节）  
@@ -16,7 +17,7 @@ class FrameEncoder {
            streamId: frame.streamId  
        });  
        // 编码payload  
-       _encodeSettingsPayload(buffer, frame.payload);  
+       _encodeSettingsPayload(buffer, settingsPayload);  
        return buffer;  
    }  
     // 编码SETTINGS ACK帧  
