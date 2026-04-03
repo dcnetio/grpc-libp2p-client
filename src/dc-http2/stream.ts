@@ -41,7 +41,7 @@ export class StreamWriter {
   private lastBackpressureCheck = 0  // 添加时间戳缓存  
   private bytesDrained = 0 // 统计下游实际消化的字节数
   private lastDrainEventAt = 0
-  private watchdogTimer: ReturnType<typeof setInterval> | undefined
+  private watchdogTimer: ReturnType<typeof setTimeout> | undefined
   private stallStartAt = 0
   private lastBytesDrainedSeen = 0
   private lastBpWarnAt = 0
@@ -219,9 +219,10 @@ export class StreamWriter {
   }  
 
   // 简单的卡顿看门狗：当队列长期高位且 bytesDrained 无进展时发出 stalled 事件
+  // 使用递归 setTimeout 而非 setInterval，避免标签页后台恢复时回调堆积导致 Violation
   private startWatchdog(intervalMs: number = 500, stallMs: number = 1500) {
     if (this.watchdogTimer) return
-    this.watchdogTimer = setInterval(() => {
+    const tick = () => {
       if (this.abortController.signal.aborted) return
       const baseThreshold = this.options.bufferSize! * 0.7
       const q = this.queueSize
@@ -230,7 +231,13 @@ export class StreamWriter {
         if (this.lastBytesDrainedSeen === this.bytesDrained) {
           if (!this.stallStartAt) this.stallStartAt = now
           if (now - this.stallStartAt >= stallMs) {
-            this.dispatchEvent(new CustomEvent('stalled', { detail: { queueSize: q, drained: this.bytesDrained, sinceMs: now - this.stallStartAt } }))
+            // 异步触发事件，让当前 tick 立即返回，避免同步事件处理器阻塞主线程
+            const detail = { queueSize: q, drained: this.bytesDrained, sinceMs: now - this.stallStartAt }
+            setTimeout(() => {
+              if (!this.abortController.signal.aborted) {
+                this.dispatchEvent(new CustomEvent('stalled', { detail }))
+              }
+            }, 0)
             // 避免持续触发，推进起点
             this.stallStartAt = now
           }
@@ -243,7 +250,10 @@ export class StreamWriter {
         // 队列回落，重置
         this.stallStartAt = 0
       }
-    }, intervalMs)
+      // 本次 tick 完成后再安排下一次，不会因主线程繁忙而堆积
+      this.watchdogTimer = setTimeout(tick, intervalMs)
+    }
+    this.watchdogTimer = setTimeout(tick, intervalMs)
   }
 
   async write(data: ArrayBuffer | Uint8Array | Blob | string): Promise<void> {  
@@ -507,7 +517,7 @@ export class StreamWriter {
       // Ignore errors when ending pushable
     }
     
-    if (this.watchdogTimer) { clearInterval(this.watchdogTimer); this.watchdogTimer = undefined }
+    if (this.watchdogTimer) { clearTimeout(this.watchdogTimer); this.watchdogTimer = undefined }
   }  
 
   // 等待内部队列被下游完全消费（用于在结束前确保尽量发送完数据）
