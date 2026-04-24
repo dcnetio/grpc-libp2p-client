@@ -74,7 +74,7 @@ async function demonstrateOptimization(client: Libp2pGrpcClient) {
     // 传统方式：逐个chunk发送
     console.time('传统单chunk方式');
     
-    const cancel1 = await client.Call(
+    await client.Call(
         '/example.Service/TraditionalStream',
         new Uint8Array(),
         30000,
@@ -94,7 +94,7 @@ async function demonstrateOptimization(client: Libp2pGrpcClient) {
     // 优化方式：批量发送chunks（frames策略）
     console.time('优化批量方式');
     
-    const cancel2 = await client.Call(
+    await client.Call(
         '/example.Service/OptimizedStream',
         new Uint8Array(),
         30000,
@@ -119,7 +119,7 @@ async function demonstrateOptimization(client: Libp2pGrpcClient) {
     // 智能批量方式：动态调整批量大小
     console.time('智能批量方式');
     
-    const cancel3 = await client.Call(
+   await client.Call(
         '/example.Service/SmartStream',
         new Uint8Array(),
         30000,

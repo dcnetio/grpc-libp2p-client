@@ -13,12 +13,14 @@ const  SETTINGS_PARAMETERS = {
 
 const defaultSettings = {
     [SETTINGS_PARAMETERS.HEADER_TABLE_SIZE]: 4096,  
-    [SETTINGS_PARAMETERS.ENABLE_PUSH]: 1,  
-    [SETTINGS_PARAMETERS.MAX_CONCURRENT_STREAMS]: 100,  
-    [SETTINGS_PARAMETERS.INITIAL_WINDOW_SIZE]: 16<<10, // 16k
-    [SETTINGS_PARAMETERS.MAX_FRAME_SIZE]:16<<10 , // 16k
+    // gRPC 客户端不使用 Server Push，禁用以避免无效的 PUSH_PROMISE 处理
+    [SETTINGS_PARAMETERS.ENABLE_PUSH]: 0,  
+    [SETTINGS_PARAMETERS.MAX_CONCURRENT_STREAMS]: 100,
+    // 匹配 parser 的实际接收缓冲区大小（4MB），避免服务端在单流上过早被限速
+    [SETTINGS_PARAMETERS.INITIAL_WINDOW_SIZE]: 4 << 20, // 4MB
+    [SETTINGS_PARAMETERS.MAX_FRAME_SIZE]: 16 << 10, // 16k
     [SETTINGS_PARAMETERS.MAX_HEADER_LIST_SIZE]: 8192  
-}; 
+};
 
 const HTTP2_PREFACE = 'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
 
@@ -92,8 +94,8 @@ static createWindowUpdateFrame(streamId: number, increment: number): Uint8Array 
     grpcMessage.set(data, 5);
     
     // 然后将完整的 gRPC 消息分割成多个 HTTP/2 DATA 帧
-    // HTTP/2 帧头为 9 字节
-    const maxDataPerFrame = maxFrameSize - 9;
+    // maxFrameSize 是 payload 上限（RFC 7540 §6.5.2 MAX_FRAME_SIZE），不含 9 字节帧头
+    const maxDataPerFrame = maxFrameSize;
     
     for (let offset = 0; offset < grpcMessage.length; offset += maxDataPerFrame) {
         const remaining = grpcMessage.length - offset;
@@ -139,13 +141,13 @@ static createWindowUpdateFrame(streamId: number, increment: number): Uint8Array 
         return Http2Frame.createFrame(0x0, flags, streamId, framedData)  
     }  
 
-    static createHeadersFrame(streamId:number,path:string, endHeaders:boolean = true,token?:string):Uint8Array {  
+    static createHeadersFrame(streamId:number, path:string, endHeaders:boolean = true, token?:string, authority = 'localhost'):Uint8Array {  
         // gRPC-Web 需要的标准 headers  
         const headersList: { [key: string]: string } = {  
             ':path': path,  
             ':method': 'POST',  
             ':scheme': 'http',  
-            ':authority': 'localhost',  
+            ':authority': authority,  
             'content-type': 'application/grpc+proto',  
             'user-agent': 'grpc-web-client/0.1',  
             'accept': 'application/grpc+proto',  

@@ -268,7 +268,6 @@ export class HPACK {
             this.dynamicTable.unshift([name, value]);
             this.dynamicTableSize += size;
         }
-        this.dynamicTable.push([name, value]);  
     }
 
     // 获取索引的头部
@@ -393,6 +392,9 @@ export class HPACK {
     // Huffman编码实现  
     huffmanEncode(bytes: Uint8Array) {  
         const result : number[] = [];  
+        // 使用高精度浮点数累积位，避免 JS 32-bit 有符号整数在位数 >31 时溢出。
+        // Huffman 码最长 30 bits，加上未输出的最多 7 bits = 37 bits，超过 32-bit 安全范围。
+        // Number 可精确表示 2^53 以内的整数，足够累积多个码字。
         let current = 0;  
         let bits = 0;  
 
@@ -401,18 +403,22 @@ export class HPACK {
             const code = this.huffmanTable.codes[b];  
             const length = this.huffmanTable.lengths[b];  
 
+            // 用乘法左移替代 <<，避免 32-bit 截断
+            current = current * (1 << length) + code;
             bits += length;  
-            current = (current << length) | code;  
 
             while (bits >= 8) {  
                 bits -= 8;  
-                result.push((current >> bits) & 0xFF);  
+                result.push(Math.floor(current / (1 << bits)) & 0xFF);
+                // 保留低 bits 位
+                current = current % (1 << bits);
             }  
         }  
 
-        // 处理剩余的位  
+        // 处理剩余的位（用 EOS 填充 1）
         if (bits > 0) {  
-            current = (current << (8 - bits)) | ((1 << (8 - bits)) - 1);  
+            const pad = 8 - bits;
+            current = current * (1 << pad) + ((1 << pad) - 1);
             result.push(current & 0xFF);  
         }  
 
@@ -438,8 +444,15 @@ export class HPACK {
                 if (name && value) headers.set(name, value);  
                 index = newIndex;  
             }  
-            else if ((firstByte & 0x20) !== 0) {  // 001xxxxx - Dynamic Table Size Update  
-                index++; // 简单跳过，实际应该更新动态表大小  
+            else if ((firstByte & 0x20) !== 0) {  // 001xxxxx - Dynamic Table Size Update (RFC 7541 §6.3)
+                const [newSize, newIndex] = this.decodeInteger(buffer, index, 5);
+                this.maxDynamicTableSize = newSize;
+                // evict entries that exceed the new limit
+                while (this.dynamicTableSize > this.maxDynamicTableSize && this.dynamicTable.length > 0) {
+                    const entry = this.dynamicTable.pop();
+                    if (entry) this.dynamicTableSize -= entry[0].length + entry[1].length + 32;
+                }
+                index = newIndex;
             }  
             else if ((firstByte & 0x10) !== 0) {  // 0001xxxx - Literal Header Field Never Indexed  
                 const [name, value, newIndex] = this.decodeLiteralHeaderWithoutIndexing(buffer, index);  
@@ -521,7 +534,7 @@ export class HPACK {
             return ['', '', newIndex];  
         }  
         
-        const headerField = this.staticTable[staticIndex];  
+        const headerField = this.getIndexedHeader(staticIndex);  
         if (!headerField) {  
             return ['', '', newIndex];  
         }  
@@ -530,12 +543,33 @@ export class HPACK {
     }  
     
     decodeLiteralHeaderWithIndexing(buffer:Uint8Array, index:number):[string, string, number] {  
-        const [staticIndex, nameIndex] = this.decodeInteger(buffer, index, 6);  
-        index = nameIndex;  
+        const [nameIndex, nextIndex] = this.decodeInteger(buffer, index, 6);  
+        index = nextIndex;  
         
         let name;  
-        if (staticIndex > 0) {  
-            const headerField = this.staticTable[staticIndex];  
+        if (nameIndex > 0) {  
+            const headerField = this.getIndexedHeader(nameIndex);  
+            name = headerField ? headerField[0] : '';  
+        } else {  
+            const [decodedName, newIndex] = this.decodeLiteralString(buffer, index);  
+            name = decodedName;  
+            index = newIndex;  
+        }  
+        
+        const [value, finalIndex] = this.decodeLiteralString(buffer, index);  
+        // RFC 7541 §6.2.1: Literal Header Field with Incremental Indexing must add to dynamic table
+        this.addToDynamicTable(name, value);
+        return [name, value, finalIndex];  
+    }  
+    
+     decodeLiteralHeaderWithoutIndexing(buffer:Uint8Array, index:number): [string, string, number] {  
+        // RFC 7541 §6.2.2 / §6.2.3: 4-bit prefix, do NOT add to dynamic table
+        const [nameIndex, nextIndex] = this.decodeInteger(buffer, index, 4);  
+        index = nextIndex;  
+        
+        let name;  
+        if (nameIndex > 0) {  
+            const headerField = this.getIndexedHeader(nameIndex);  
             name = headerField ? headerField[0] : '';  
         } else {  
             const [decodedName, newIndex] = this.decodeLiteralString(buffer, index);  
@@ -545,10 +579,6 @@ export class HPACK {
         
         const [value, finalIndex] = this.decodeLiteralString(buffer, index);  
         return [name, value, finalIndex];  
-    }  
-    
-     decodeLiteralHeaderWithoutIndexing(buffer:Uint8Array, index:number): [string, string, number] {  
-        return this.decodeLiteralHeaderWithIndexing(buffer, index);  
     } 
     
 

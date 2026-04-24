@@ -319,6 +319,20 @@ export class Libp2pGrpcClient {
     this.token = token;
   }
 
+  /** 从 peerAddr 提取 HTTP/2 :authority 字段（host:port 格式） */
+  private getAuthority(): string {
+    try {
+      const addr = this.peerAddr.toString();
+      const ip4 = addr.match(/\/ip4\/(\d[\d.]+)\/tcp\/(\d+)/);
+      if (ip4) return `${ip4[1]}:${ip4[2]}`;
+      const ip6 = addr.match(/\/ip6\/([^/]+)\/tcp\/(\d+)/);
+      if (ip6) return `[${ip6[1]}]:${ip6[2]}`;
+      const dns = addr.match(/\/dns(?:4|6)?\/([.\w-]+)\/tcp\/(\d+)/);
+      if (dns) return `${dns[1]}:${dns[2]}`;
+    } catch { /* ignore */ }
+    return 'localhost';
+  }
+
   async unaryCall(
     method: string,
     requestData: Uint8Array,
@@ -328,13 +342,19 @@ export class Libp2pGrpcClient {
     let responseData: Uint8Array | null = null;
     let responseBuffer: Uint8Array[] = []; // 添加缓冲区来累积数据
     let responseDataExpectedLength = -1; // 当前响应的期望长度
+    /** 跨 DATA 帧的部分 gRPC 消息头缓冲（当一帧的 payload < 5 字节时积累） */
+    let headerPartialBuffer: Uint8Array[] = [];
     const hpack = new HPACK();
     let exitFlag = false;
     let errMsg = "";
     let isResponseComplete = false; // 添加标志来标识响应是否完成
+    /** 事件驱动：响应完成时的唤醒函数 */
+    let notifyResponseComplete: (() => void) | null = null;
     let connection: Connection | null = null;
     let state: ConnectionState | null = null;
     let streamSlotAcquired = false;
+    // 提升 writer 作用域到 finally 可访问，确保错误路径下也能调用 abort() 清理资源
+    let writerRef: StreamWriter | null = null;
     try {
       // const stream = await this.node.dialProtocol(this.peerAddr, this.protocol)
       connection = await this.acquireConnection(false);
@@ -357,6 +377,7 @@ export class Libp2pGrpcClient {
       const writer = new StreamWriter(stream, {
         bufferSize: 16 * 1024 * 1024,
       });
+      writerRef = writer;
       try {
         writer.addEventListener("backpressure", (e: CustomEvent) => {
           const d = e.detail || {};
@@ -392,6 +413,7 @@ export class Libp2pGrpcClient {
         }
         exitFlag = true;
         errMsg = `GOAWAY received: code=${info.errorCode}`;
+        notifyResponseComplete?.(); // 唤醒等待中的 Promise
         try {
           connection?.close();
         } catch (err) {
@@ -411,42 +433,57 @@ export class Libp2pGrpcClient {
       parser.registerOutboundStream(streamId);
       responseDataExpectedLength = -1; // 重置期望长度
       responseBuffer = []; // 重置缓冲区
+      headerPartialBuffer = []; // 重置跨帧头部缓冲
       parser.onData = (payload, frameHeader)  => {
         //接收数据
         if (responseDataExpectedLength === -1) {
           //grpc消息头部未读取
+          // 如果有跨帧积累的部分头字节，先与本帧 payload 合并
+          let effectivePayload = payload;
+          if (headerPartialBuffer.length > 0) {
+            headerPartialBuffer.push(payload);
+            const totalLen = headerPartialBuffer.reduce((s, c) => s + c.length, 0);
+            effectivePayload = new Uint8Array(totalLen);
+            let off = 0;
+            for (const c of headerPartialBuffer) { effectivePayload.set(c, off); off += c.length; }
+            headerPartialBuffer = [];
+          }
           //提取gRPC消息头部
-          if (payload.length < 5) {
+          if (effectivePayload.length < 5) {
+            // 头部字节不足 5，先缓存，等待后续帧补全
+            headerPartialBuffer.push(effectivePayload);
             return;
           }
-          const lengthBytes = payload.slice(1, 5); // 消息长度的4字节
+          const lengthBytes = effectivePayload.slice(1, 5); // 消息长度的4字节
           responseDataExpectedLength = new DataView(
             lengthBytes.buffer,
             lengthBytes.byteOffset
-          ).getUint32(0, false); // big-endian
-          if (responseDataExpectedLength < 0) {
-            throw new Error("Invalid gRPC message length");
-          }
-          if (responseDataExpectedLength + 5 > payload.length) {
+          ).getUint32(0, false); // big-endian（getUint32 返回无符号整数，结果不会为负）
+          if (responseDataExpectedLength + 5 > effectivePayload.length) {
             // 如果当前 payload 不足以包含完整的 gRPC 消息，缓存数据
-            const grpcData = payload.subarray(5);
+            const grpcData = effectivePayload.subarray(5);
             responseBuffer.push(grpcData);
             responseDataExpectedLength -= grpcData.length; // 更新期望长度
             return;
           } else {
-            // 如果当前 payload 足以包含完整的 gRPC 消息，重置缓冲区
-            const grpcData = payload.subarray(5); // 提取完整的 gRPC 消息
+            // payload 已包含完整的 gRPC 消息体，精确截取（避免尾部多余字节污染）
+            const msgLen = responseDataExpectedLength;
+            const grpcData = effectivePayload.slice(5, 5 + msgLen);
             responseBuffer.push(grpcData);
             responseData = grpcData;
             isResponseComplete = true;
-            responseDataExpectedLength = -1; // 重置期望长度
+            responseDataExpectedLength = -1;
+            notifyResponseComplete?.();
           }
         } else if (responseDataExpectedLength > 0) {
           //grpc消息头部已读取
-          responseBuffer.push(payload); // 将数据添加到缓冲区
-          responseDataExpectedLength -= payload.length; // 更新期望长度
+          responseDataExpectedLength -= payload.length;
           if (responseDataExpectedLength <= 0) {
-            // 如果缓冲区中的数据已经完全处理，重置缓冲区
+            // 超收时截掉多余字节
+            const exactPayload = responseDataExpectedLength < 0
+              ? payload.slice(0, payload.length + responseDataExpectedLength)
+              : payload;
+            responseBuffer.push(exactPayload);
             responseData = new Uint8Array(
               responseBuffer.reduce((sum, chunk) => sum + chunk.length, 0)
             );
@@ -456,46 +493,31 @@ export class Libp2pGrpcClient {
               offset += chunk.length;
             }
             responseDataExpectedLength = -1;
-            isResponseComplete = true; // 设置响应完成标志
+            isResponseComplete = true;
+            notifyResponseComplete?.();
+          } else {
+            responseBuffer.push(payload); // 还不完整，继续累积
           }
         }
-        // 检查是否是流的最后一个帧（END_STREAM 标志）
+        // END_STREAM 兜底：数据路径已处理大多数情况；此分支仅在边缘情况下触发
         if (frameHeader && frameHeader.flags & 0x1 && !isResponseComplete) {
-          // END_STREAM flag
-          // 合并所有缓冲的数据
-          const totalLength = responseBuffer.reduce(
-            (sum, chunk) => sum + chunk.length,
-            0
-          );
-          responseData = new Uint8Array(totalLength);
-          let offset = 0;
-          for (const chunk of responseBuffer) {
-            responseData.set(chunk, offset);
-            offset += chunk.length;
+          if (responseBuffer.length > 0) {
+            const totalLength = responseBuffer.reduce((sum, c) => sum + c.length, 0);
+            responseData = new Uint8Array(totalLength);
+            let offset = 0;
+            for (const chunk of responseBuffer) { responseData.set(chunk, offset); offset += chunk.length; }
+          } else {
+            responseData = new Uint8Array(0);
           }
           isResponseComplete = true;
+          notifyResponseComplete?.();
         }
       };
       parser.onEnd = () => {
-        //接收结束
+        // 流结束时若响应未标记完成（空响应 / 纯 trailers），强制标记并唤醒等待者
         if (!isResponseComplete) {
-          isResponseComplete = true; // 设置响应完成标志
-          if (responseBuffer.length === 0) {
-            responseData = new Uint8Array(); // 如果没有数据，返回空数组
-          } else {
-            // 合并所有缓冲的数据
-            const totalLength = responseBuffer.reduce(
-              (sum, chunk) => sum + chunk.length,
-              0
-            );
-            responseData = new Uint8Array(totalLength);
-            let offset = 0;
-            for (const chunk of responseBuffer) {
-              responseData.set(chunk, offset);
-              offset += chunk.length;
-            }
-            isResponseComplete = true;
-          }
+          isResponseComplete = true;
+          notifyResponseComplete?.();
         }
       };
       parser.onSettings = () => {
@@ -510,6 +532,7 @@ export class Libp2pGrpcClient {
         } else if (plainHeaders.get("grpc-status") !== undefined) {
           exitFlag = true;
           errMsg = plainHeaders.get("grpc-message") || "gRPC call failed";
+          notifyResponseComplete?.(); // 唤醒等待中的 Promise
         }
       };
       // 启动后台流处理，捕获任何异步错误
@@ -519,6 +542,7 @@ export class Libp2pGrpcClient {
         if (!errMsg) {
           errMsg = error instanceof Error ? error.message : 'Stream processing failed';
         }
+        notifyResponseComplete?.(); // 流处理异常也需唤醒等待者
       });
       
       // 握手
@@ -528,9 +552,11 @@ export class Libp2pGrpcClient {
       const settingFrme = Http2Frame.createSettingsFrame();
       await writer.write(settingFrme);
       // 等待对端 SETTINGS 或 ACK，择一即可，避免偶发握手竞态
+      // 注意：未胜出的 promise 内部有超时定时器，它们最终会 reject。
+      // 必须绑定 .catch(…) 消除错误，否则在 Node.js 新版本中会导致 UnhandledPromiseRejection 崩溃。
       await Promise.race([
-        parser.waitForPeerSettings(1000),
-        parser.waitForSettingsAck(),
+        parser.waitForPeerSettings(1000).catch(() => {}),
+        parser.waitForSettingsAck().catch(() => {}),
         new Promise<void>((res) => setTimeout(res, 300)),
       ]);
       // 即使未等到，也继续；多数实现会随后发送
@@ -539,7 +565,8 @@ export class Libp2pGrpcClient {
         streamId,
         method,
         true,
-        this.token
+        this.token,
+        this.getAuthority()
       );
       await writer.write(headerFrame);
       // 直接按帧大小分片发送（保持与之前一致的稳定路径）
@@ -560,21 +587,18 @@ export class Libp2pGrpcClient {
           frameSendTimeout
         );
       }
-      // 等待responseData 不为空,或超时
-      await new Promise((resolve, reject) => {
+      // 等待 responseData 不为空，或超时（事件驱动，不轮询）
+      await new Promise<void>((resolve, reject) => {
+        if (isResponseComplete || exitFlag) { resolve(); return; }
         const t = setTimeout(() => {
+          notifyResponseComplete = null;
           reject(new Error("gRPC response timeout"));
         }, timeout);
-        const checkResponse = () => {
-          if (isResponseComplete || exitFlag) {
-            // 使用新的完成标志
-            clearTimeout(t);
-            resolve(responseData);
-          } else {
-            setTimeout(checkResponse, 50);
-          }
+        notifyResponseComplete = () => {
+          clearTimeout(t);
+          notifyResponseComplete = null;
+          resolve();
         };
-        checkResponse();
       });
       try {
         await writer.flush(timeout);
@@ -584,8 +608,17 @@ export class Libp2pGrpcClient {
       console.error("unaryCall error:", err);
       throw err;
     } finally {
+      // 必须先 abort writer（立即强制停止 pushable + stream），再 close stream。
+      // 若顺序颠倒：stream.close() 会等待服务端半关闭确认，网络异常时永久挂住，
+      // 导致 writer.abort() 永远不执行 → watchdog 定时器 / pushable 泄漏。
+      // writer.abort() 内部幂等，成功路径下 writer.end() 已调用 cleanup()，安全。
+      writerRef?.abort('unaryCall cleanup');
       if (stream) {
-        await stream.close();
+        try {
+          await stream.close();
+        } catch {
+          // 流已被 abort，close() 会立即抛出，忽略即可。
+        }
       }
       if (streamSlotAcquired && state) {
         state.activeStreams = Math.max(0, state.activeStreams - 1);
@@ -632,6 +665,8 @@ export class Libp2pGrpcClient {
     const internalController = new AbortController();
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
     let stream: Stream | null = null;
+    // 保存外部 abort 监听器引用，以便操作结束后移除，防止内存泄漏
+    let contextAbortHandler: (() => void) | undefined;
 
     const profile: TransportProfile =
       options?.transportProfile ?? this.getDefaultTransportProfile(mode);
@@ -654,18 +689,17 @@ export class Libp2pGrpcClient {
 
     // 如果提供了外部信号，监听它
     if (context?.signal) {
-      // 如果外部信号已经触发中止，立即返回
+      // 如果外部信号已经触发中止，立即返回——避免启动 IIFE 后在 catch 中再次调用 onErrorCallback
       if (context.signal.aborted) {
         if (onErrorCallback) {
           onErrorCallback(new Error("Operation aborted by context"));
         }
-        cancelOperation();
+        return cancelOperation;
       }
 
-      // 监听外部的abort事件
-      context.signal.addEventListener("abort", () => {
-        cancelOperation();
-      });
+      // 监听外部的abort事件（保存引用以便后续移除，防止内存泄漏）
+      contextAbortHandler = () => { cancelOperation(); };
+      context.signal.addEventListener("abort", contextAbortHandler);
     }
 
     // 超时Promise
@@ -678,13 +712,39 @@ export class Libp2pGrpcClient {
 
     // 主操作Promise
     const operationPromise = (async () => {
-      let messageBuffer = new Uint8Array(0); // 用于累积跨帧的消息数据
+      /**
+       * 统一错误报告：确保 onErrorCallback 只被调用一次，
+       * 并同时中止操作，防止后续再触发 onEndCallback。
+       * 适用于 onGoaway / onHeaders / processStream.catch / onData 等各个错误路径。
+       */
+      let errorCallbackFired = false;
+      const reportError = (err: unknown) => {
+        if (errorCallbackFired) return;
+        errorCallbackFired = true;
+        internalController.abort();
+        if (onErrorCallback) onErrorCallback(err);
+      };
+
+      /** 分段列表缓冲，避免每次 payload 到达时 O(n) 全量拷贝 */
+      let msgChunks: Uint8Array[] = [];
+      let msgTotalLen = 0;
       let expectedMessageLength = -1; // 当前消息的期望长度
+      /** 将分段列表合并为单一 Uint8Array（仅在需要时调用） */
+      const flattenMsgBuffer = (): Uint8Array => {
+        if (msgChunks.length === 0) return new Uint8Array(0);
+        if (msgChunks.length === 1) return msgChunks[0];
+        const out = new Uint8Array(msgTotalLen);
+        let off = 0;
+        for (const c of msgChunks) { out.set(c, off); off += c.length; }
+        return out;
+      };
       const hpack = new HPACK();
       let connection: Connection | null = null;
       let connectionKey: string | null = null;
       let state: ConnectionState | null = null;
       let streamSlotAcquired = false;
+      // 提升 writer 作用域到 finally 可访问，确保 unary/server-streaming 模式下也能清理资源
+      let writer: StreamWriter | null = null;
 
       try {
         // 检查是否已经中止
@@ -734,7 +794,7 @@ export class Libp2pGrpcClient {
         });
         const streamManager = this.getStreamManagerFor(connection as object);
         const streamId = await streamManager.getNextAppLevelStreamId();
-        const writer = new StreamWriter(stream, {
+        writer = new StreamWriter(stream, {
           bufferSize: 16 * 1024 * 1024,
         });
         try {
@@ -756,11 +816,11 @@ export class Libp2pGrpcClient {
               const payload = new Uint8Array(8);
               crypto.getRandomValues?.(payload);
               const ping = Http2Frame.createFrame(0x6, 0x0, 0, payload);
-              writer.write(ping);
+              writer!.write(ping);
             } catch { /* ignore ping write errors */ }
           });
         } catch { /* ignore addEventListener errors */ }
-        const parser = new HTTP2Parser(writer, {
+        const parser = new HTTP2Parser(writer!, {
           compatibilityMode: !useFlowControl,
         });
         parser.onGoaway = (info) => {
@@ -774,10 +834,8 @@ export class Libp2pGrpcClient {
               new Error("Connection received GOAWAY")
             );
           }
-          if (onErrorCallback) {
-            onErrorCallback(new Error(`GOAWAY received: code=${info.errorCode}`));
-          }
-          internalController.abort();
+          // reportError 统一完成：标记已报错 + abort + 触发回调（幂等，不会重复触发）
+          reportError(new Error(`GOAWAY received: code=${info.errorCode}`));
           try {
             connection?.close();
           } catch (err) {
@@ -805,7 +863,7 @@ export class Libp2pGrpcClient {
               parser,
               streamId,
               frame,
-              writer,
+              writer!,
               internalController.signal,
               sendWindowTimeout
             );
@@ -813,7 +871,7 @@ export class Libp2pGrpcClient {
             if (internalController.signal.aborted) {
               throw new Error("Operation aborted");
             }
-            await writer.write(frame);
+            await writer!.write(frame);
           }
         };
         const writeDataFrames = async (frames: Uint8Array[]) => {
@@ -823,66 +881,47 @@ export class Libp2pGrpcClient {
         };
 
         // 在各个回调中检查是否已中止
-        parser.onData = async  (payload): Promise<void> => {
-          // 检查是否已中止
-          if (internalController.signal.aborted) {
-            return;
-          }
+        parser.onData = async (payload): Promise<void> => {
+          if (internalController.signal.aborted) return;
 
           try {
-            // 将新数据添加到消息缓冲区
-            const newBuffer = new Uint8Array(
-              messageBuffer.length + payload.length
-            );
-            newBuffer.set(messageBuffer);
-            newBuffer.set(payload, messageBuffer.length);
-            messageBuffer = newBuffer;
+            // 追加到分段列表，O(1)，不拷贝历史数据
+            msgChunks.push(payload);
+            msgTotalLen += payload.length;
 
             // 处理缓冲区中的完整消息
-            while (messageBuffer.length > 0) {
-              // 如果已经中止，停止处理
-              if (internalController.signal.aborted) {
-                return;
-              }
+            while (msgTotalLen > 0) {
+              if (internalController.signal.aborted) return;
 
-              // 如果还没有读取消息长度，且缓冲区有足够数据
-              if (expectedMessageLength === -1 && messageBuffer.length >= 5) {
-                // 读取 gRPC 消息头：1字节压缩标志 + 4字节长度
-                const lengthBytes = messageBuffer.slice(1, 5);
+              // 读取 gRPC 消息头（5字节）
+              if (expectedMessageLength === -1 && msgTotalLen >= 5) {
+                const flat = flattenMsgBuffer();
+                msgChunks = [flat];
+                const lengthBytes = flat.slice(1, 5);
                 expectedMessageLength = new DataView(
                   lengthBytes.buffer,
                   lengthBytes.byteOffset
-                ).getUint32(0, false); // big-endian
+                ).getUint32(0, false);
               }
 
-              // 如果知道期望长度且有足够数据
-              if (
-                expectedMessageLength !== -1 &&
-                messageBuffer.length >= expectedMessageLength + 5
-              ) {
-                // 提取完整消息（跳过5字节头部）
-                const completeMessage = messageBuffer.slice(
-                  5,
-                  expectedMessageLength + 5
-                );
-
-                // 调用回调处理这个完整消息
+              // 有完整消息
+              if (expectedMessageLength !== -1 && msgTotalLen >= expectedMessageLength + 5) {
+                const flat = flattenMsgBuffer();
+                msgChunks = [flat];
+                const completeMessage = flat.slice(5, expectedMessageLength + 5);
                 onDataCallback(completeMessage);
-
-                // 移除已处理的消息，保留剩余数据
-                messageBuffer = messageBuffer.slice(expectedMessageLength + 5);
+                // 移除已处理消息，保留剩余
+                const remaining = flat.slice(expectedMessageLength + 5);
+                msgChunks = remaining.length > 0 ? [remaining] : [];
+                msgTotalLen = remaining.length;
                 expectedMessageLength = -1;
               } else {
-                // 没有足够数据构成完整消息，等待更多数据
                 break;
               }
             }
           } catch (error: unknown) {
-            if (onErrorCallback) {
-              onErrorCallback(error);
-            } else {
-              throw error;
-            }
+            // reportError 统一报错并中止，防止 onEndCallback 在数据处理异常后仍被调用
+            reportError(error);
           }
         };
 
@@ -891,7 +930,7 @@ export class Libp2pGrpcClient {
           if (internalController.signal.aborted) return;
 
           const ackSettingFrame = Http2Frame.createSettingsAckFrame();
-          writer.write(ackSettingFrame);
+          writer!.write(ackSettingFrame);
         };
 
         parser.onHeaders = (headers) => {
@@ -904,19 +943,18 @@ export class Libp2pGrpcClient {
           } else if (plainHeaders.get("grpc-status") !== undefined) {
             const errMsg =
               plainHeaders.get("grpc-message") || "gRPC call failed";
-            const err = new Error(errMsg);
-            if (onErrorCallback) {
-              onErrorCallback(err);
-            } else {
-              throw err;
-            }
+            // reportError 统一完成：标记已报错 + abort + 触发回调（幂等，不会重复触发）
+            reportError(new Error(errMsg));
           }
         };
       // 启动后台流处理
       parser.processStream(stream).catch((error: unknown) => {
         console.error('Error in processStream:', error);
-        if (onErrorCallback) {
-          onErrorCallback(error);
+        // 仅在操作尚未被外部取消/超时时才通过 reportError 报告，
+        // 防止超时后的迟到回调误触 onErrorCallback。
+        // reportError 同时中止操作，确保 onEndCallback 不会在流异常后被调用。
+        if (!internalController.signal.aborted) {
+          reportError(error);
         }
       });
 
@@ -944,18 +982,15 @@ export class Libp2pGrpcClient {
         }
 
         // 等待对端 SETTINGS 或 ACK，择一即可，避免偶发握手竞态
+        // 注意：未胜出的 promise 内部有超时定时器，它们最终会 reject。
+        // 必须绑定 .catch(…) 消除错误，否则在 Node.js 新版本中会导致 UnhandledPromiseRejection 崩溃。
         {
           await Promise.race([
-            parser.waitForPeerSettings(1000),
-            parser.waitForSettingsAck(),
+            parser.waitForPeerSettings(1000).catch(() => {}),
+            parser.waitForSettingsAck().catch(() => {}),
             new Promise<void>((res) => setTimeout(res, 300)),
           ]);
           // 即使未等到，也继续；多数实现会随后发送
-        }
-
-        // 检查是否已中止
-        if (internalController.signal.aborted) {
-          throw new Error("Operation aborted");
         }
 
         // 检查是否已中止
@@ -968,7 +1003,8 @@ export class Libp2pGrpcClient {
           streamId,
           method,
           true,
-          this.token
+          this.token,
+          this.getAuthority()
         );
         if (mode === "unary" || mode === "server-streaming") {
           await writer.write(headerFrame);
@@ -1009,7 +1045,15 @@ export class Libp2pGrpcClient {
             reject: (reason?: unknown) => void;
           }[] = [];
 
+          /** 事件驱动：批处理完成后唤醒 waitForQueue 等待者 */
+          const batchDoneWaiters: Array<() => void> = [];
+
           let isProcessing = false;
+
+          const _notifyBatchDone = () => {
+            const ws = batchDoneWaiters.splice(0);
+            for (const fn of ws) { try { fn(); } catch { /* ignore */ } }
+          };
 
           const processNextBatch = async () => {
             if (isProcessing || processingQueue.length === 0) return;
@@ -1065,12 +1109,12 @@ export class Libp2pGrpcClient {
               isProcessing = false;
 
               // 如果队列中还有数据，继续处理
-              if (
-                processingQueue.length > 0 &&
-                !internalController.signal.aborted
-              ) {
-                // 使用 setTimeout 避免阻塞，让新数据有机会加入队列
-                setTimeout(() => processNextBatch(), 0);
+              if (processingQueue.length > 0 && !internalController.signal.aborted) {
+                // 直接递归调用（已是 async，自动让出事件循环）
+                processNextBatch().catch((err) => { console.error("Error in processNextBatch:", err); });
+              } else {
+                // 队列清空，唤醒等待者
+                _notifyBatchDone();
               }
             }
           };
@@ -1128,42 +1172,32 @@ export class Libp2pGrpcClient {
             throw error;
           }
 
-          // 等待所有剩余的数据处理完成，添加超时保护
-          const queueWaitStart = Date.now();
-          const maxQueueWaitMs = timeout; // 使用主超时时间
-
-          while (processingQueue.length > 0 || isProcessing) {
-            if (internalController.signal.aborted) {
-              throw new Error("Operation aborted");
-            }
-
-            // 防止无限等待
-            if (Date.now() - queueWaitStart > maxQueueWaitMs) {
-              // 清理剩余队列
-              const remainingQueue = processingQueue.splice(0);
-              remainingQueue.forEach((item) => {
-                try {
-                  item.reject(new Error("Queue wait timeout"));
-                } catch (err) {
-                  console.warn("Error rejecting timeout promise:", err);
-                }
-              });
-              throw new Error("Queue processing timeout");
-            }
-
-            await new Promise((resolve) => setTimeout(resolve, 10));
-          }
+          // 等待所有剩余的数据处理完成（事件驱动，无 10ms 轮询）
+          await new Promise<void>((resolve, reject) => {
+            const check = () => {
+              if (internalController.signal.aborted) {
+                reject(new Error("Operation aborted"));
+                return;
+              }
+              if (processingQueue.length === 0 && !isProcessing) {
+                resolve();
+                return;
+              }
+              // processNextBatch 结束时会通知这里
+              batchDoneWaiters.push(check);
+            };
+            check();
+          });
 
           // 检查是否已中止
           if (internalController.signal.aborted) {
             throw new Error("Operation aborted");
           }
 
-          const finalFrame = Http2Frame.createDataFrame(
-            streamId,
-            new Uint8Array(),
-            true
-          );
+          // 发送纯 HTTP/2 END_STREAM 信号帧（0 字节 payload），而非带 gRPC 消息头的空消息。
+          // createDataFrame 会额外附加 5 字节 gRPC 消息头 [0,0,0,0,0]，服务端会将其解析
+          // 为一个长度=0 的额外 gRPC 消息，而不仅仅是流结束信号，可能导致协议混淆。
+          const finalFrame = Http2Frame.createFrame(0x0, 0x01, streamId, new Uint8Array(0));
           await writeFrame(finalFrame);
           // 在结束前尽量冲刷内部队列，避免服务器看到部分数据 + context canceled
           try {
@@ -1177,10 +1211,24 @@ export class Libp2pGrpcClient {
           throw new Error("Operation aborted");
         }
 
-        await parser.waitForEndOfStream(0);
-
-        if (onEndCallback) {
-          onEndCallback();
+        // 仅在未中止时等待并回调：
+        // 1. 若已中止（如 onHeaders gRPC 错误），跳过 waitForEndOfStream(0) 避免永久阻塞
+        //    （waitForEndOfStream(0) 无超时，需等到 processStream 自然结束，
+        //     而 processStream 结束依赖 stream.close()，但 stream.close() 在 finally 中——形成死锁）
+        // 2. 避免在 onErrorCallback 之后再调用 onEndCallback
+        if (!internalController.signal.aborted) {
+          await parser.waitForEndOfStream(0);
+          // Yield one microtask tick so that processStream.catch (which calls
+          // reportError + internalController.abort()) has a chance to run before
+          // we check abort status. Without this yield, if the stream died
+          // unexpectedly (network error), onEndCallback and onErrorCallback
+          // could both fire because _notifyEndOfStream() is called in
+          // processStream's catch block before the re-throw schedules the
+          // .catch handler as a microtask.
+          await Promise.resolve();
+          if (!internalController.signal.aborted && onEndCallback) {
+            onEndCallback();
+          }
         }
       } catch (err: unknown) {
         // 如果是由于取消导致的错误，使用特定的错误消息
@@ -1189,12 +1237,14 @@ export class Libp2pGrpcClient {
           err instanceof Error &&
           err.message === "Operation aborted"
         ) {
-          if (onErrorCallback) {
+          // onHeaders / onGoaway / processStream 错误已通过 reportError 处理，
+          // 此处仅在回调尚未触发时才报告（外部取消/超时场景）
+          if (!errorCallbackFired && onErrorCallback) {
             onErrorCallback(new Error("Operation cancelled by user"));
           }
-        } else if (onErrorCallback) {
+        } else if (!errorCallbackFired && onErrorCallback) {
           onErrorCallback(err);
-        } else {
+        } else if (!errorCallbackFired) {
           if (err instanceof Error) {
             console.error("asyncCall error:", err.message);
           } else {
@@ -1203,11 +1253,20 @@ export class Libp2pGrpcClient {
         }
       } finally {
         clearTimeout(timeoutHandle);
+        // 移除外部 abort 监听器，防止 AbortController 复用时触发迟到的 cancelOperation()
+        if (contextAbortHandler && context?.signal) {
+          context.signal.removeEventListener("abort", contextAbortHandler);
+        }
+        // 必须先 abort writer（立即强制停止 pushable + stream），再 close stream。
+        // 若顺序颠倒：stream.close() 等待服务端半关闭确认，网络异常时永久挂住，
+        // writer.abort() 永远不执行 → watchdog / pushable 泄漏。
+        // abort() 内部幂等，重复调用安全。
+        writer?.abort('Call cleanup');
         if (stream) {
           try {
             await stream.close();
-          } catch (err) {
-            console.error("Error closing stream:", err);
+          } catch {
+            // 流已被 abort，close() 会立即抛出，忽略即可。
           }
         }
         // 如果本次强制使用了新连接，结束时尽量关闭它，避免连接泄漏

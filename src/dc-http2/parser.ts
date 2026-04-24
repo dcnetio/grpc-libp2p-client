@@ -11,7 +11,12 @@ type ParserOptions = {
 const HTTP2_PREFACE = new TextEncoder().encode("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
 
 export class HTTP2Parser {
-  buffer: Uint8Array;
+  /** 分段缓冲：避免每次 chunk 到达时 O(n) 全量拷贝 */
+  private bufferChunks: Uint8Array[] = [];
+  private bufferTotalLength = 0;
+  /** 兼容旧代码读取 buffer —— 仅在必须全量访问时调用 _flattenBuffer() */
+  get buffer(): Uint8Array { return this._flattenBuffer(); }
+  set buffer(v: Uint8Array) { this.bufferChunks = v.length ? [v] : []; this.bufferTotalLength = v.length; }
   settingsAckReceived: boolean;
   peerSettingsReceived: boolean;
   connectionWindowSize: number;
@@ -21,7 +26,11 @@ export class HTTP2Parser {
   sendConnWindow: number;
   sendStreamWindows: Map<number, number>;
   peerInitialStreamWindow: number;
-  private sendWindowWaiters: Array<() => void>;
+  private sendWindowWaiters: Array<{ resolve: () => void; reject: (e: Error) => void; cleanup?: () => void }>;
+  // 事件驱动等待器
+  private settingsAckWaiters: Array<{ resolve: () => void; reject: (e: Error) => void }>;
+  private peerSettingsWaiters: Array<{ resolve: () => void; reject: (e: Error) => void }>;
+  private endOfStreamWaiters: Array<{ resolve: () => void; reject: (e: Error) => void }>;
   onSettings?: (frameHeader: Frame) => void;
   onData?: (payload: Uint8Array, frameHeader: Frame) => void;
   onEnd?: () => void;
@@ -33,7 +42,8 @@ export class HTTP2Parser {
   private readonly compatibilityMode: boolean;
 
   constructor(writer: StreamWriter, options?: ParserOptions) {
-    this.buffer = new Uint8Array(0);
+    this.bufferChunks = [];
+    this.bufferTotalLength = 0;
     this.settingsAckReceived = false;
     this.peerSettingsReceived = false;
     // 初始化连接级别的流控制窗口大小（默认值：65,535）
@@ -47,11 +57,30 @@ export class HTTP2Parser {
     this.sendStreamWindows = new Map();
     this.peerInitialStreamWindow = 65535;
     this.sendWindowWaiters = [];
+    this.settingsAckWaiters = [];
+    this.peerSettingsWaiters = [];
+    this.endOfStreamWaiters = [];
     // 结束标志
     this.endFlag = false;
 
     this.writer = writer;
     this.compatibilityMode = options?.compatibilityMode ?? false;
+  }
+
+  /** 将所有分段合并为一个连续 Uint8Array（仅在必要时调用）*/
+  private _flattenBuffer(): Uint8Array {
+    if (this.bufferChunks.length === 0) return new Uint8Array(0);
+    if (this.bufferChunks.length === 1) return this.bufferChunks[0];
+    const out = new Uint8Array(this.bufferTotalLength);
+    let off = 0;
+    for (const c of this.bufferChunks) { out.set(c, off); off += c.length; }
+    return out;
+  }
+
+  /** 唤醒所有发送窗口等待者 */
+  private _wakeWindowWaiters() {
+    const ws = this.sendWindowWaiters.splice(0);
+    for (const w of ws) { try { w.resolve(); } catch { /* ignore */ } }
   }
 
   // 持续处理流数据
@@ -61,68 +90,88 @@ export class HTTP2Parser {
       for await (const chunk of stream) {
         this._processChunk(chunk);
       }
-      
+
       // Stream 结束后的清理工作
       if (!this.compatibilityMode && !this.endFlag) {
-        this.endFlag = true;
-        try {
-          this.onEnd?.();
-        } catch (err) {
-          console.error("Error during onEnd callback:", err);
-        }
+        try { this.onEnd?.(); } catch (err) { console.error("Error during onEnd callback:", err); }
+      }
+      // 无论何种模式，stream 结束时都通知 waitForEndOfStream 等待者，
+      // 防止 compatibilityMode=true（server-streaming）时 waitForEndOfStream(0) 永久挂死
+      if (!this.endFlag) {
+        this._notifyEndOfStream();
       }
     } catch (error) {
       console.error("Error processing stream:", error);
+      // 确保 waitForEndOfStream 等待者得到通知，防止 operationPromise 后台挂死
+      if (!this.endFlag) {
+        this._notifyEndOfStream();
+      }
       throw error;
     }
   }
 
-  // 处理单个数据块
+  // 处理单个数据块 — 分段列表追加，避免每次 O(n) 全量拷贝
   private _processChunk(chunk: Uint8Array | { subarray(): Uint8Array }): void {
     // chunk 是 Uint8ArrayList 或 Uint8Array
     const newData: Uint8Array = 'subarray' in chunk && typeof chunk.subarray === 'function'
       ? chunk.subarray()
       : (chunk as Uint8Array);
-    
-    // 原作者之前的 O(N) 内存拷贝优化被保留，去掉了存在 onEnd 竞态的 setTimeout
-    const newBuffer = new Uint8Array(this.buffer.length + newData.length);
-    newBuffer.set(this.buffer);
-    newBuffer.set(newData, this.buffer.length);
-    this.buffer = newBuffer;
+
+    // 追加到分段列表，O(1)，不拷贝历史数据
+    if (newData.length > 0) {
+      this.bufferChunks.push(newData);
+      this.bufferTotalLength += newData.length;
+    }
+
+    // 将所有分段合并为一块后处理帧（只合并一次，后续 slice 替换）
+    // 仅在确实有完整帧时才触发合并，碎片仅 push 不合并
+    if (this.bufferTotalLength < 9) return;
+
+    // 合并一次
+    const flat = this._flattenBuffer();
+    this.bufferChunks = [flat];
+    // bufferTotalLength 保持不变
 
     // 持续处理所有完整的帧
     let readOffset = 0;
-    while (this.buffer.length - readOffset >= 9) {
+    while (flat.length - readOffset >= 9) {
       // 判断是否有HTTP/2前导
-      if (this.buffer.length - readOffset >= 24 && this.isHttp2Preface(this.buffer.subarray(readOffset))) {
+      if (flat.length - readOffset >= 24 && this.isHttp2Preface(flat.subarray(readOffset))) {
         readOffset += 24;
         // 发送SETTINGS帧
         const settingFrame = Http2Frame.createSettingsFrame();
         this.writer.write(settingFrame);
         continue;
       }
-      
-      const frameHeader = this._parseFrameHeader(this.buffer.subarray(readOffset));
+
+      const frameHeader = this._parseFrameHeader(flat.subarray(readOffset));
       const totalFrameLength = 9 + frameHeader.length;
 
       // 检查是否有完整的帧
-      if (this.buffer.length - readOffset < totalFrameLength) {
+      if (flat.length - readOffset < totalFrameLength) {
         break;
       }
-      // 获取完整帧数据
-      const frameData = this.buffer.subarray(readOffset, readOffset + totalFrameLength);
+      // 获取完整帧数据（subarray 视图，零拷贝）
+      const frameData = flat.subarray(readOffset, readOffset + totalFrameLength);
 
       // 处理不同类型的帧
       this._handleFrame(frameHeader, frameData).catch((err) => {
         console.error("Error handling frame:", err);
       });
 
-      // 移动偏移量
       readOffset += totalFrameLength;
     }
-    
+
+    // 保留未消费的尾部字节（slice 一次，后续仍分段追加）
     if (readOffset > 0) {
-      this.buffer = this.buffer.slice(readOffset);
+      if (readOffset >= flat.length) {
+        this.bufferChunks = [];
+        this.bufferTotalLength = 0;
+      } else {
+        const remaining = flat.slice(readOffset);
+        this.bufferChunks = [remaining];
+        this.bufferTotalLength = remaining.length;
+      }
     }
   }
 
@@ -134,53 +183,51 @@ export class HTTP2Parser {
     return true;
   }
 
-  // 移除之前的 for await 循环代码
-  private _oldProcessStream_removed() {
-    // 这个方法已被上面的事件驱动实现替代
-  }
-
-  // 等待SETTINGS ACK
+  // 等待SETTINGS ACK — 事件驱动，无轮询
   waitForSettingsAck(): Promise<void> {
     return new Promise((resolve, reject) => {
-      if (this.settingsAckReceived) {
-        resolve();
-        return;
-      }
-      const interval = setInterval(() => {
-        if (this.settingsAckReceived) {
-          clearInterval(interval);
-          clearTimeout(timeout);
-          resolve();
-        }
-      }, 100);
-
+      if (this.settingsAckReceived) { resolve(); return; }
+      const waiter = { resolve, reject };
+      this.settingsAckWaiters.push(waiter);
       const timeout = setTimeout(() => {
-        clearInterval(interval);
+        const idx = this.settingsAckWaiters.indexOf(waiter);
+        if (idx >= 0) this.settingsAckWaiters.splice(idx, 1);
         reject(new Error("Settings ACK timeout"));
       }, 30000);
+      // 覆盖 resolve 以便超时前自动清理定时器
+      waiter.resolve = () => { clearTimeout(timeout); resolve(); };
+      waiter.reject  = (e: Error) => { clearTimeout(timeout); reject(e); };
     });
   }
 
-  // 等待接收来自对端的 SETTINGS（非 ACK）
+  /** 内部调用：SETTINGS ACK 收到时唤醒所有等待者 */
+  private _notifySettingsAck() {
+    this.settingsAckReceived = true;
+    const ws = this.settingsAckWaiters.splice(0);
+    for (const w of ws) { try { w.resolve(); } catch { /* ignore */ } }
+  }
+
+  // 等待接收来自对端的 SETTINGS（非 ACK）— 事件驱动，无轮询
   waitForPeerSettings(timeoutMs: number = 30000): Promise<void> {
     return new Promise((resolve, reject) => {
-      if (this.peerSettingsReceived) {
-        resolve();
-        return;
-      }
-      const interval = setInterval(() => {
-        if (this.peerSettingsReceived) {
-          clearInterval(interval);
-          clearTimeout(timeout);
-          resolve();
-        }
-      }, 100);
-
+      if (this.peerSettingsReceived) { resolve(); return; }
+      const waiter = { resolve, reject };
+      this.peerSettingsWaiters.push(waiter);
       const timeout = setTimeout(() => {
-        clearInterval(interval);
+        const idx = this.peerSettingsWaiters.indexOf(waiter);
+        if (idx >= 0) this.peerSettingsWaiters.splice(idx, 1);
         reject(new Error("Peer SETTINGS timeout"));
       }, timeoutMs);
+      waiter.resolve = () => { clearTimeout(timeout); resolve(); };
+      waiter.reject  = (e: Error) => { clearTimeout(timeout); reject(e); };
     });
+  }
+
+  /** 内部调用：收到对端 SETTINGS（非 ACK）时唤醒等待者 */
+  private _notifyPeerSettings() {
+    this.peerSettingsReceived = true;
+    const ws = this.peerSettingsWaiters.splice(0);
+    for (const w of ws) { try { w.resolve(); } catch { /* ignore */ } }
   }
 
   // 注册我们要发送数据的出站流（用于初始化该流的对端窗口）
@@ -210,56 +257,46 @@ export class HTTP2Parser {
     this.sendConnWindow = Math.min(0x7fffffff, this.sendConnWindow + bytes);
     const cur = this.sendStreamWindows.get(streamId) ?? 0;
     this.sendStreamWindows.set(streamId, Math.min(0x7fffffff, cur + bytes));
+    // 窗口增大，唤醒等待者
+    this._wakeWindowWaiters();
   }
 
-  // 等待可用发送窗口（两个窗口都需要 >0）
-  async waitForSendWindow(streamId: number, minBytes: number = 1, timeoutMs: number = 30000): Promise<void> {
-    const start = Date.now();
+  // 等待可用发送窗口 — 事件驱动，WINDOW_UPDATE/SETTINGS 收到时直接唤醒
+  waitForSendWindow(streamId: number, minBytes: number = 1, timeoutMs: number = 30000): Promise<void> {
+    const { conn, stream } = this.getSendWindows(streamId);
+    if (conn >= minBytes && stream >= minBytes) return Promise.resolve();
+
     return new Promise((resolve, reject) => {
-      let interval: ReturnType<typeof setInterval> | null = null;
       let settled = false;
-      const check = () => {
-        const { conn, stream } = this.getSendWindows(streamId);
-        if (conn >= minBytes && stream >= minBytes) {
-          if (!settled) {
+      const timeout = timeoutMs > 0
+        ? setTimeout(() => {
+            if (settled) return;
             settled = true;
-            if (interval) {
-              clearInterval(interval);
-              interval = null;
-            }
-            resolve();
-          }
-          return true;
-        }
-        if (Date.now() - start > timeoutMs) {
-          if (!settled) {
-            settled = true;
-            if (interval) {
-              clearInterval(interval);
-              interval = null;
-            }
+            const idx = this.sendWindowWaiters.findIndex(w => w.resolve === resolveWrap);
+            if (idx >= 0) this.sendWindowWaiters.splice(idx, 1);
             reject(new Error('Send window wait timeout'));
-          }
-          return true;
+          }, timeoutMs)
+        : undefined;
+
+      const resolveWrap = () => {
+        if (settled) return;
+        const { conn: c2, stream: s2 } = this.getSendWindows(streamId);
+        if (c2 >= minBytes && s2 >= minBytes) {
+          settled = true;
+          if (timeout) clearTimeout(timeout);
+          resolve();
+        } else {
+          // 窗口仍不够，重新入队等待下一次更新
+          this.sendWindowWaiters.push({ resolve: resolveWrap, reject: rejectWrap });
         }
-        return false;
       };
-      if (check()) return;
-      const tick = () => {
-        if (!check()) {
-          // 继续等待
-        }
+      const rejectWrap = (e: Error) => {
+        if (settled) return;
+        settled = true;
+        if (timeout) clearTimeout(timeout);
+        reject(e);
       };
-      const wake = () => { tick(); };
-      // 简单的等待模型：依赖 WINDOW_UPDATE 到达时调用 wake
-      this.sendWindowWaiters.push(wake);
-      // 同时做一个轻微的轮询，防止错过唤醒
-      interval = setInterval(() => {
-        if (check() && interval) {
-          clearInterval(interval);
-          interval = null;
-        }
-      }, 50);
+      this.sendWindowWaiters.push({ resolve: resolveWrap, reject: rejectWrap });
     });
   }
 
@@ -268,7 +305,7 @@ export class HTTP2Parser {
     switch (frameHeader.type) {
       case FRAME_TYPES.SETTINGS:
         if ((frameHeader.flags & FRAME_FLAGS.ACK) === FRAME_FLAGS.ACK) {
-          this.settingsAckReceived = true;
+          this._notifySettingsAck();
         } else {
           //接收到Setting请求,进行解析
           const settingsPayload = frameData.slice(9);
@@ -278,11 +315,14 @@ export class HTTP2Parser {
           for (let i = 0; i < settingsPayload.length; i += 6) {
             // 正确解析：2字节ID + 4字节值
             const id = (settingsPayload[i] << 8) | settingsPayload[i + 1];
-            const value =
+            // >>> 0 将结果转为无符号 32 位整数，防止高位为 1 时（如 0xffffffff）
+            // 被 JS 按有符号解读为负数，导致 maxConcurrentStreams 等字段为负值
+            const value = (
               (settingsPayload[i + 2] << 24) |
               (settingsPayload[i + 3] << 16) |
               (settingsPayload[i + 4] << 8) |
-              settingsPayload[i + 5];
+              settingsPayload[i + 5]
+            ) >>> 0;
 
             settings[id] = value;
             if (id === 4) {
@@ -322,51 +362,56 @@ export class HTTP2Parser {
           if (this.onSettings) {
             this.onSettings(frameHeader);
           }
-          // 标记已收到对端 SETTINGS
-          this.peerSettingsReceived = true;
-          // 唤醒等待窗口（以防部分实现通过 SETTINGS 改变有效窗口）
-          const waiters = this.sendWindowWaiters.splice(0);
-          waiters.forEach(fn => { try { fn(); } catch (e) { console.debug('waiter error', e); } });
+          // 标记已收到对端 SETTINGS 并唤醒等待者
+          this._notifyPeerSettings();
+          // 唤醒发送窗口等待者（以防部分实现通过 SETTINGS 改变有效窗口）
+          this._wakeWindowWaiters();
         }
         break;
 
-      case FRAME_TYPES.DATA:
+      case FRAME_TYPES.DATA: {
         // 处理数据帧
         if (this.onData) {
           this.onData(frameData.slice(9), frameHeader); // 跳过帧头
         }
         // 更新流窗口和连接窗口
-        try {
-          // 更新流级别的窗口
-          if (frameHeader.streamId !== 0) {
-            const streamWindowUpdate = Http2Frame.createWindowUpdateFrame(
-              frameHeader.streamId,
-              frameHeader.length ?? 0
-            );
-            this.writer.write(streamWindowUpdate);
-          }
+        // 仅在帧有实际数据时才发送 WINDOW_UPDATE：
+        // RFC 7540 §6.9.1 明确禁止 increment=0 的 WINDOW_UPDATE，
+        // 服务端必须以 PROTOCOL_ERROR 响应，会导致连接被强制关闭。
+        // 空 DATA 帧（如纯 END_STREAM 帧）length=0，不需要归还窗口。
+        const dataLength = frameHeader.length ?? 0;
+        if (dataLength > 0) {
+          try {
+            // 更新流级别的窗口
+            if (frameHeader.streamId !== 0) {
+              const streamWindowUpdate = Http2Frame.createWindowUpdateFrame(
+                frameHeader.streamId,
+                dataLength
+              );
+              this.writer.write(streamWindowUpdate);
+            }
 
-          // 更新连接级别的窗口
-          const connWindowUpdate = Http2Frame.createWindowUpdateFrame(
-            0,
-            frameHeader.length ?? 0
-          );
-          this.writer.write(connWindowUpdate);
-        } catch (err) {
-          console.error("[HTTP2] Error sending window update:", err);
+            // 更新连接级别的窗口
+            const connWindowUpdate = Http2Frame.createWindowUpdateFrame(
+              0,
+              dataLength
+            );
+            this.writer.write(connWindowUpdate);
+          } catch (err) {
+            console.error("[HTTP2] Error sending window update:", err);
+          }
         }
         //判断是否是最后一个帧
         if (
           (frameHeader.flags & FRAME_FLAGS.END_STREAM) ===
           FRAME_FLAGS.END_STREAM
         ) {
-          this.endFlag = true;
-          if (this.onEnd) {
-            this.onEnd();
-          }
+          this.onEnd?.();
+          this._notifyEndOfStream();
           return;
         }
         break;
+      }
       case FRAME_TYPES.HEADERS:
         // 处理头部帧
         if (this.onHeaders) {
@@ -377,31 +422,24 @@ export class HTTP2Parser {
           (frameHeader.flags & FRAME_FLAGS.END_STREAM) ===
           FRAME_FLAGS.END_STREAM
         ) {
-          this.endFlag = true;
-          if (this.onEnd) {
-            this.onEnd();
-          }
+          this.onEnd?.();
+          this._notifyEndOfStream();
           return;
         }
         break;
       case FRAME_TYPES.WINDOW_UPDATE:
-        // 处理窗口更新帧
-        this.handleWindowUpdateFrame(
-          frameHeader,
-          frameData
-        );
-        // 更新发送窗口（对端接收窗口）
+        // 处理窗口更新帧（同时更新接收侧诊断计数器和发送侧流控窗口，只解析一次）
         try {
-          const inc = this.parseWindowUpdateFrame(frameData, frameHeader).windowSizeIncrement;
+          const result = this.handleWindowUpdateFrame(frameHeader, frameData);
+          // 更新发送方向窗口（对端的接收窗口）
           if (frameHeader.streamId === 0) {
-            this.sendConnWindow += inc;
+            this.sendConnWindow += result.windowSizeIncrement;
           } else {
             const cur = this.sendStreamWindows.get(frameHeader.streamId) ?? this.peerInitialStreamWindow;
-            this.sendStreamWindows.set(frameHeader.streamId, cur + inc);
+            this.sendStreamWindows.set(frameHeader.streamId, cur + result.windowSizeIncrement);
           }
-          const waiters = this.sendWindowWaiters.splice(0);
-          waiters.forEach(fn => { try { fn(); } catch (e) { console.debug('waiter error', e); } });
-        } catch { /* ignore WINDOW_UPDATE parse errors */ }
+          this._wakeWindowWaiters();
+        } catch { /* ignore WINDOW_UPDATE parse errors (e.g. increment=0 is RFC PROTOCOL_ERROR) */ }
         break;
       case FRAME_TYPES.PING:
         // 处理PING帧
@@ -427,12 +465,12 @@ export class HTTP2Parser {
         } catch (err) {
           console.error('Error during GOAWAY callback:', err);
         }
-        this.endFlag = true;
         try {
           this.onEnd?.();
         } catch (err) {
           console.error('Error during GOAWAY onEnd callback:', err);
         }
+        this._notifyEndOfStream();
         break;
       }
 
@@ -441,10 +479,8 @@ export class HTTP2Parser {
       //     this.handlePushPromiseFrame(frameHeader, frameData);
       //     break;
       case FRAME_TYPES.RST_STREAM:
-        this.endFlag = true;
-        if (this.onEnd) {
-          this.onEnd();
-        }
+        this.onEnd?.();
+        this._notifyEndOfStream();
         break;
       default:
         console.debug("Unknown frame type:", frameHeader.type);
@@ -455,8 +491,9 @@ export class HTTP2Parser {
     const length = (buffer[0] << 16) | (buffer[1] << 8) | buffer[2];
     const type = buffer[3];
     const flags = buffer[4];
+    // RFC 7540 §4.1: most significant bit is reserved and MUST be ignored on receipt
     const streamId =
-      (buffer[5] << 24) | (buffer[6] << 16) | (buffer[7] << 8) | buffer[8];
+      ((buffer[5] << 24) | (buffer[6] << 16) | (buffer[7] << 8) | buffer[8]) & 0x7fffffff;
 
     return {
       length,
@@ -486,53 +523,32 @@ export class HTTP2Parser {
     }
   }
 
-  //等待流结束
+  // 等待流结束 — 事件驱动，onEnd 触发时直接唤醒，无 setInterval 轮询
   waitForEndOfStream(waitTime: number): Promise<void> {
     return new Promise((resolve, reject) => {
-      // If the stream has already ended, resolve immediately
-      if (this.endFlag) {
-        resolve();
-        return;
-      }
-      // 如果是0 ,则不设置超时
-      let timeout: ReturnType<typeof setTimeout> | null = null;
-      if (waitTime > 0) {
-        timeout = setTimeout(() => {
-          clearInterval(interval);
-          reject(new Error("End of stream timeout"));
-        }, waitTime);
-      }
+      if (this.endFlag) { resolve(); return; }
 
-      // Check interval for real-time endFlag monitoring
-      const checkInterval = 100; // Check every 100 milliseconds
-      // Set an interval to check the endFlag regularly
-      const interval = setInterval(() => {
-        if (this.endFlag) {
-          if (timeout !== null) {
-            clearTimeout(timeout);
-          }
-          clearInterval(interval);
-          resolve();
-        }
-      }, checkInterval);
+      const waiter = { resolve, reject };
+      this.endOfStreamWaiters.push(waiter);
 
-      // If the onEnd is triggered externally, it should now be marked manually
-      const originalOnEnd = this.onEnd;
-      this.onEnd = () => {
-        if (!this.endFlag) {
-          // The external trigger may set endFlag; if not, handle here
-          this.endFlag = true;
-        }
-        if (timeout !== null) {
-          clearTimeout(timeout);
-        }
-        clearInterval(interval);
-        resolve();
-        if (originalOnEnd) {
-          originalOnEnd(); // Call the original onEnd function if set
-        }
-      };
+      const timeout = waitTime > 0
+        ? setTimeout(() => {
+            const idx = this.endOfStreamWaiters.indexOf(waiter);
+            if (idx >= 0) this.endOfStreamWaiters.splice(idx, 1);
+            reject(new Error("End of stream timeout"));
+          }, waitTime)
+        : null;
+
+      waiter.resolve = () => { if (timeout) clearTimeout(timeout); resolve(); };
+      waiter.reject  = (e: Error) => { if (timeout) clearTimeout(timeout); reject(e); };
     });
+  }
+
+  /** 内部调用：流结束时唤醒所有 waitForEndOfStream 等待者 */
+  private _notifyEndOfStream() {
+    this.endFlag = true;
+    const ws = this.endOfStreamWaiters.splice(0);
+    for (const w of ws) { try { w.resolve(); } catch { /* ignore */ } }
   }
 
   // 解析 WINDOW_UPDATE 帧
