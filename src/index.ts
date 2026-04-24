@@ -949,11 +949,9 @@ export class Libp2pGrpcClient {
         };
       // 启动后台流处理
       parser.processStream(stream).catch((error: unknown) => {
-        console.error('Error in processStream:', error);
-        // 仅在操作尚未被外部取消/超时时才通过 reportError 报告，
-        // 防止超时后的迟到回调误触 onErrorCallback。
-        // reportError 同时中止操作，确保 onEndCallback 不会在流异常后被调用。
+        // abort() 触发的清理错误属于预期行为，不打印错误日志，不重复触发回调
         if (!internalController.signal.aborted) {
+          console.error('Error in processStream:', error);
           reportError(error);
         }
       });

@@ -101,7 +101,14 @@ export class HTTP2Parser {
         this._notifyEndOfStream();
       }
     } catch (error) {
-      console.error("Error processing stream:", error);
+      // abort() 触发的清理错误（如 'Call cleanup' / 'unaryCall cleanup'）属于预期行为，降级为 debug 日志
+      const errMsg = error instanceof Error ? error.message : String(error);
+      const isAbortCleanup = /cleanup/i.test(errMsg) || /aborted/i.test(errMsg);
+      if (isAbortCleanup) {
+        console.debug("[processStream] stream aborted (expected):", errMsg);
+      } else {
+        console.error("Error processing stream:", error);
+      }
       // 确保 waitForEndOfStream 等待者得到通知，防止 operationPromise 后台挂死
       if (!this.endFlag) {
         this._notifyEndOfStream();
