@@ -537,12 +537,17 @@ export class Libp2pGrpcClient {
       };
       // 启动后台流处理，捕获任何异步错误
       parser.processStream(stream).catch((error: unknown) => {
-        console.error('Error in processStream:', error);
-        exitFlag = true;
-        if (!errMsg) {
-          errMsg = error instanceof Error ? error.message : 'Stream processing failed';
+        // 若响应已完整收到（isResponseComplete=true），后置的网络层错误属于正常的
+        // 连接拆除过程（如服务端 RST、连接关闭），不影响已成功的调用结果，静默忽略。
+        // 若响应尚未完成，才记录错误并唤醒等待者，触发超时/错误路径。
+        if (!isResponseComplete) {
+          console.error('Error in processStream:', error);
+          exitFlag = true;
+          if (!errMsg) {
+            errMsg = error instanceof Error ? error.message : 'Stream processing failed';
+          }
+          notifyResponseComplete?.(); // 流处理异常也需唤醒等待者
         }
-        notifyResponseComplete?.(); // 流处理异常也需唤醒等待者
       });
       
       // 握手
@@ -1255,6 +1260,10 @@ export class Libp2pGrpcClient {
         if (contextAbortHandler && context?.signal) {
           context.signal.removeEventListener("abort", contextAbortHandler);
         }
+        // 首先标记操作已结束（正常或异常），确保 processStream.catch 不会把
+        // writer.abort() 产生的 'Call cleanup' 错误误判为真实错误并触发 onErrorCallback。
+        // internalController.abort() 是幂等的，重复调用安全。
+        internalController.abort();
         // 必须先 abort writer（立即强制停止 pushable + stream），再 close stream。
         // 若顺序颠倒：stream.close() 等待服务端半关闭确认，网络异常时永久挂住，
         // writer.abort() 永远不执行 → watchdog / pushable 泄漏。

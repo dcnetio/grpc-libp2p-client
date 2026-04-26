@@ -101,18 +101,20 @@ export class HTTP2Parser {
         this._notifyEndOfStream();
       }
     } catch (error) {
-      // abort() 触发的清理错误（如 'Call cleanup' / 'unaryCall cleanup'）属于预期行为，降级为 debug 日志
-      const errMsg = error instanceof Error ? error.message : String(error);
-      const isAbortCleanup = /cleanup/i.test(errMsg) || /aborted/i.test(errMsg);
-      if (isAbortCleanup) {
-        console.debug("[processStream] stream aborted (expected):", errMsg);
-      } else {
-        console.error("Error processing stream:", error);
-      }
       // 确保 waitForEndOfStream 等待者得到通知，防止 operationPromise 后台挂死
       if (!this.endFlag) {
         this._notifyEndOfStream();
       }
+      // 仅过滤我们自己主动触发的清理错误（reason 固定为 'Call cleanup' / 'unaryCall cleanup'）。
+      // 不使用 /aborted/i，因为 libp2p / 浏览器网络层可能抛出含 "aborted" 字样的真实错误
+      // （如 "AbortError: The operation was aborted", "Connection aborted by peer"），
+      // 若误匹配会导致 reportError 不被调用，onErrorCallback 丢失，调用方误认为成功。
+      const errMsg = error instanceof Error ? error.message : String(error);
+      if (/cleanup/i.test(errMsg)) {
+        // 预期的主动清理，无需 re-throw，.catch in index.ts 不需要处理它
+        return;
+      }
+      console.error("Error processing stream:", error);
       throw error;
     }
   }
