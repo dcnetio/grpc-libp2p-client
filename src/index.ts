@@ -369,7 +369,7 @@ export class Libp2pGrpcClient {
         throw err;
       }
       stream = await connection.newStream(this.protocol, {
-        maxOutboundStreams: 10,
+        maxOutboundStreams: 50,
         negotiateFully: false,
       });
       const streamManager = this.getStreamManagerFor(connection as object);
