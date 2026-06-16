@@ -10,6 +10,45 @@ import type { Multiaddr } from "@multiformats/multiaddr";
 const dialTimeout = 5000; // 5秒
 const DEFAULT_SEND_WINDOW_TIMEOUT = 15000;
 
+/**
+ * 解码 gRPC `grpc-message` trailer。
+ * 按 gRPC 协议规范，该字段使用百分号编码（percent-encoding）承载 UTF-8 字节，
+ * 非 ASCII 字符（如中文错误信息）会以 %XX 形式出现。直接透传会导致上层拿到
+ * 形如 "%E8%AF%B7..." 的乱码，因此在读取时统一解码为可读文本。
+ * 解码失败时回退原始字符串，保证健壮性。
+ */
+function decodeGrpcMessage(message: string): string {
+  if (!message || message.indexOf("%") === -1) {
+    return message;
+  }
+  try {
+    const isHex = (c: string): boolean =>
+      (c >= "0" && c <= "9") ||
+      (c >= "a" && c <= "f") ||
+      (c >= "A" && c <= "F");
+    const bytes: number[] = [];
+    for (let i = 0; i < message.length; i++) {
+      const ch = message[i];
+      // 仅当 % 后紧跟两个合法十六进制字符时才按 percent-encoding 解码，
+      // 避免 parseInt 对 "-d" 等非法序列的符号/部分解析导致字节错乱。
+      if (
+        ch === "%" &&
+        i + 2 < message.length &&
+        isHex(message[i + 1]) &&
+        isHex(message[i + 2])
+      ) {
+        bytes.push(parseInt(message.substr(i + 1, 2), 16));
+        i += 2;
+        continue;
+      }
+      bytes.push(message.charCodeAt(i) & 0xff);
+    }
+    return new TextDecoder("utf-8").decode(new Uint8Array(bytes));
+  } catch {
+    return message;
+  }
+}
+
 type CallMode =
   | "unary"
   | "server-streaming"
@@ -531,7 +570,7 @@ export class Libp2pGrpcClient {
           // 成功状态
         } else if (plainHeaders.get("grpc-status") !== undefined) {
           exitFlag = true;
-          errMsg = plainHeaders.get("grpc-message") || "gRPC call failed";
+          errMsg = decodeGrpcMessage(plainHeaders.get("grpc-message") || "") || "gRPC call failed";
           notifyResponseComplete?.(); // 唤醒等待中的 Promise
         }
       };
@@ -947,7 +986,8 @@ export class Libp2pGrpcClient {
             // 成功状态
           } else if (plainHeaders.get("grpc-status") !== undefined) {
             const errMsg =
-              plainHeaders.get("grpc-message") || "gRPC call failed";
+              decodeGrpcMessage(plainHeaders.get("grpc-message") || "") ||
+              "gRPC call failed";
             // reportError 统一完成：标记已报错 + abort + 触发回调（幂等，不会重复触发）
             reportError(new Error(errMsg));
           }
