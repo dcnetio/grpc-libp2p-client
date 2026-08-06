@@ -1,5 +1,16 @@
 import { pushable, Pushable } from 'it-pushable'  
-import type { Stream } from '@libp2p/interface'
+
+/**
+ * The client can be consumed from an application that owns a different
+ * @libp2p/interface installation. Keep this boundary structural so libp2p's
+ * private stream fields do not make otherwise compatible streams unassignable.
+ */
+export interface WritableMessageStream {
+  send(data: Uint8Array): boolean
+  onDrain(options?: { signal?: AbortSignal }): Promise<void>
+  close(options?: { signal?: AbortSignal }): Promise<void>
+  abort(error?: Error): void
+}
 
 interface StreamWriterOptions {  
   /** 分块大小（默认1MB） */  
@@ -52,7 +63,7 @@ export class StreamWriter {
   private log?: { trace?: (...args: unknown[]) => void }
 
   constructor(  
-    private stream: Stream,  
+    private stream: WritableMessageStream,
     private options: StreamWriterOptions = {}  
   ) {  
     // 验证 stream 参数
@@ -565,4 +576,4 @@ private dispatchEvent(event: CustomEvent) {
     }))  
   }  
    
-}  
+}

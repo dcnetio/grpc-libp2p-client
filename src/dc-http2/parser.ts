@@ -1,5 +1,4 @@
 import type { Frame } from "./types.js";
-import type { Stream } from "@libp2p/interface";
 import { FRAME_TYPES, FRAME_FLAGS } from "./types.js";
 import { Http2Frame } from "./frame.js";
 import { StreamWriter } from "./stream.js";
@@ -84,7 +83,7 @@ export class HTTP2Parser {
   }
 
   // 持续处理流数据
-  async processStream(stream: Stream) {
+  async processStream(stream: AsyncIterable<unknown>) {
     try {
       // libp2p v3: Stream 实现了 AsyncIterable
       for await (const chunk of stream) {
@@ -114,17 +113,23 @@ export class HTTP2Parser {
         // 预期的主动清理，无需 re-throw，.catch in index.ts 不需要处理它
         return;
       }
-      console.error("Error processing stream:", error);
+      // The caller owns error reporting. Logging here and then rethrowing
+      // produces duplicate console errors, including expected local aborts.
       throw error;
     }
   }
 
   // 处理单个数据块 — 分段列表追加，避免每次 O(n) 全量拷贝
-  private _processChunk(chunk: Uint8Array | { subarray(): Uint8Array }): void {
-    // chunk 是 Uint8ArrayList 或 Uint8Array
-    const newData: Uint8Array = 'subarray' in chunk && typeof chunk.subarray === 'function'
-      ? chunk.subarray()
-      : (chunk as Uint8Array);
+  private _processChunk(chunk: unknown): void {
+    // Uint8Array and Uint8ArrayList both expose subarray(). Validate the
+    // transport value at runtime instead of coupling to one libp2p type copy.
+    const chunkWithSubarray = chunk as {
+      subarray?: (begin?: number, end?: number) => Uint8Array
+    } | null;
+    if (typeof chunkWithSubarray?.subarray !== "function") {
+      throw new TypeError("Received an invalid libp2p stream chunk");
+    }
+    const newData = chunkWithSubarray.subarray();
 
     // 追加到分段列表，O(1)，不拷贝历史数据
     if (newData.length > 0) {

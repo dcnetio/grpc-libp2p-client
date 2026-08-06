@@ -2,13 +2,13 @@ import type { Libp2p } from "libp2p";
 import { HTTP2Parser } from "./dc-http2/parser.js";
 import { StreamWriter } from "./dc-http2/stream.js";
 import { Http2Frame } from "./dc-http2/frame.js";
-import type { Connection, Stream } from "@libp2p/interface";
 import { HPACK } from "./dc-http2/hpack.js";
 
 import type { Multiaddr } from "@multiformats/multiaddr";
 
 const dialTimeout = 5000; // 5秒
 const DEFAULT_SEND_WINDOW_TIMEOUT = 15000;
+const CALL_CLEANUP_TIMEOUT = 5000;
 
 /**
  * 解码 gRPC `grpc-message` trailer。
@@ -55,6 +55,12 @@ type CallMode =
   | "client-streaming"
   | "bidirectional";
 type TransportProfile = "flow-control" | "compatibility";
+// Derive transport types from the injected Libp2p instance. Importing
+// Connection/Stream directly from @libp2p/interface makes a linked consumer
+// with another compatible package instance fail type-checking because the two
+// dependency copies carry different generic/private identities.
+type Connection = Awaited<ReturnType<Libp2p["dial"]>>;
+type Stream = Awaited<ReturnType<Connection["newStream"]>>;
 
 interface CallOptions {
   batchSize?: number;
@@ -453,10 +459,10 @@ export class Libp2pGrpcClient {
         exitFlag = true;
         errMsg = `GOAWAY received: code=${info.errorCode}`;
         notifyResponseComplete?.(); // 唤醒等待中的 Promise
-        try {
-          connection?.close();
-        } catch (err) {
-          console.warn("Error closing connection after GOAWAY:", err);
+        if (connection) {
+          void connection.close().catch((err) => {
+            console.warn("Error closing connection after GOAWAY:", err);
+          });
         }
       };
       parser.onSettingsParsed = (settings) => {
@@ -724,9 +730,15 @@ export class Libp2pGrpcClient {
       }
       if (stream) {
         try {
-          stream.close();
+          // Cancellation must stop the old stream immediately. A detached
+          // close() promise can reject with StreamAbortEvent and leaves the
+          // previous call alive while the caller starts its retry.
+          stream.abort(new Error("Operation cancelled"));
         } catch (err) {
-          console.error("Error closing stream on cancel:", err);
+          const message = err instanceof Error ? err.message : String(err);
+          if (!/clos(?:ed|ing)|abort/i.test(message)) {
+            console.warn("Error aborting stream on cancel:", err);
+          }
         }
       }
     };
@@ -880,10 +892,10 @@ export class Libp2pGrpcClient {
           }
           // reportError 统一完成：标记已报错 + abort + 触发回调（幂等，不会重复触发）
           reportError(new Error(`GOAWAY received: code=${info.errorCode}`));
-          try {
-            connection?.close();
-          } catch (err) {
-            console.warn("Error closing connection after GOAWAY:", err);
+          if (connection) {
+            void connection.close().catch((err) => {
+              console.warn("Error closing connection after GOAWAY:", err);
+            });
           }
         };
         parser.onSettingsParsed = (settings) => {
@@ -1341,8 +1353,21 @@ export class Libp2pGrpcClient {
       await Promise.race([operationPromise, timeoutPromise]);
       return cancelOperation;
     } catch (error) {
-      // 确保在出错时也进行清理
+      // Give the previous operation a bounded opportunity to run its finally
+      // block before the caller starts another stream. This prevents timeout
+      // retries from accumulating live close/end listeners.
       cancelOperation();
+      let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          operationPromise.catch(() => undefined),
+          new Promise<void>((resolve) => {
+            cleanupTimer = setTimeout(resolve, CALL_CLEANUP_TIMEOUT);
+          }),
+        ]);
+      } finally {
+        if (cleanupTimer !== undefined) clearTimeout(cleanupTimer);
+      }
       throw error;
     }
   }
