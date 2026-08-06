@@ -116,6 +116,10 @@ export class StreamWriter {
     return this.p._queueSize  
   }  
 
+  get aborted(): boolean {
+    return this.abortController.signal.aborted
+  }
+
   // 智能获取平均队列大小
   private getAverageQueueSize(): number {
     const now = Date.now()

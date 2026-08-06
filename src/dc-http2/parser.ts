@@ -76,6 +76,18 @@ export class HTTP2Parser {
     return out;
   }
 
+  /**
+   * 控制帧一律「发完即忘」：writer.write() 返回 Promise，
+   * 同步 try/catch 捕不到它的 reject，必须显式挂 .catch()。
+   */
+  private _writeControlFrame(frame: Uint8Array, label: string): void {
+    void this.writer.write(frame).catch((err) => {
+      // 流已关闭时写失败属于正常收尾，不作为错误上报
+      if (this.writer.aborted) return;
+      console.error(`[HTTP2] Error sending ${label}:`, err);
+    });
+  }
+
   /** 唤醒所有发送窗口等待者 */
   private _wakeWindowWaiters() {
     const ws = this.sendWindowWaiters.splice(0);
@@ -154,7 +166,7 @@ export class HTTP2Parser {
         readOffset += 24;
         // 发送SETTINGS帧
         const settingFrame = Http2Frame.createSettingsFrame();
-        this.writer.write(settingFrame);
+        this._writeControlFrame(settingFrame, "SETTINGS frame");
         continue;
       }
 
@@ -395,25 +407,21 @@ export class HTTP2Parser {
         // 空 DATA 帧（如纯 END_STREAM 帧）length=0，不需要归还窗口。
         const dataLength = frameHeader.length ?? 0;
         if (dataLength > 0) {
-          try {
-            // 更新流级别的窗口
-            if (frameHeader.streamId !== 0) {
-              const streamWindowUpdate = Http2Frame.createWindowUpdateFrame(
-                frameHeader.streamId,
-                dataLength
-              );
-              this.writer.write(streamWindowUpdate);
-            }
-
-            // 更新连接级别的窗口
-            const connWindowUpdate = Http2Frame.createWindowUpdateFrame(
-              0,
+          // 更新流级别的窗口
+          if (frameHeader.streamId !== 0) {
+            const streamWindowUpdate = Http2Frame.createWindowUpdateFrame(
+              frameHeader.streamId,
               dataLength
             );
-            this.writer.write(connWindowUpdate);
-          } catch (err) {
-            console.error("[HTTP2] Error sending window update:", err);
+            this._writeControlFrame(streamWindowUpdate, "stream WINDOW_UPDATE");
           }
+
+          // 更新连接级别的窗口
+          const connWindowUpdate = Http2Frame.createWindowUpdateFrame(
+            0,
+            dataLength
+          );
+          this._writeControlFrame(connWindowUpdate, "connection WINDOW_UPDATE");
         }
         //判断是否是最后一个帧
         if (
@@ -529,12 +537,7 @@ export class HTTP2Parser {
     }
     // 反馈PONG帧
     const pongFrame = Http2Frame.createPongFrame(frameData.slice(9));
-    try {
-      this.writer.write(pongFrame);
-    } catch (error) {
-      console.error("Error sending PONG frame:", error);
-      throw error;
-    }
+    this._writeControlFrame(pongFrame, "PONG frame");
   }
 
   // 等待流结束 — 事件驱动，onEnd 触发时直接唤醒，无 setInterval 轮询
