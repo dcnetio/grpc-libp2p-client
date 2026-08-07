@@ -116,6 +116,18 @@ interface ConnectionState {
   activeStreams: number;
   maxConcurrentStreams: number;
   waiters: Array<{ resolve: () => void; reject: (error: Error) => void }>;
+  /** 是否已收到 GOAWAY：此后不再复用该连接开新流，等既有流排空后关闭。 */
+  goawayReceived: boolean;
+  /** 关闭是否已发起，保证排空关闭只执行一次。 */
+  closeIssued: boolean;
+  /**
+   * 已在申请槽位、但尚未计入 activeStreams 的调用数。
+   *
+   * notifyStreamSlotAvailable 会先把 waiter 从队列 shift 出来再 resolve，等待者
+   * 恢复执行前 waiters 已空且 activeStreams 可能已归零；若此时判定「已排空」就会
+   * 关掉马上要被使用的连接。该计数覆盖「拿到槽位到 activeStreams 自增」之间的窗口。
+   */
+  pendingStreams: number;
 }
 
 class StreamManager {
@@ -185,10 +197,45 @@ export class Libp2pGrpcClient {
         activeStreams: 0,
         maxConcurrentStreams: Number.POSITIVE_INFINITY,
         waiters: [],
+        goawayReceived: false,
+        closeIssued: false,
+        pendingStreams: 0,
       };
       this.connectionStates.set(connection, state);
     }
     return state;
+  }
+
+  /**
+   * GOAWAY 后的「排空关闭」。
+   *
+   * 按 HTTP/2 语义（RFC 9113 §6.8）GOAWAY 表示「不要再开新流」，ID 不大于
+   * lastStreamId 的既有流有权继续跑完；errorCode=NO_ERROR 更只是优雅下线通知。
+   * 本库中每个 Call 各自开一条 libp2p 流并在其上跑独立的 HTTP/2 会话，因此一条
+   * GOAWAY 的作用域仅限它自己那条流——直接 connection.close() 会把复用同一条
+   * libp2p 连接的其他并发 Call 一起拆掉（并行生成时表现为另一路流突然中断）。
+   *
+   * 所以收到 GOAWAY 只做标记（连接已从池中摘除，不会再被复用），由最后一条流
+   * 结束时调用本方法真正关闭，既不误伤兄弟流，也不泄漏连接。
+   */
+  private closeConnectionIfDrained(
+    connection: Connection | null,
+    state: ConnectionState | null
+  ) {
+    if (!connection || !state) return;
+    if (!state.goawayReceived || state.closeIssued) return;
+    // 三者都为空才算真正排空：活跃流、排队等槽位的调用、已拿到槽位但尚未计数的调用。
+    if (
+      state.activeStreams > 0 ||
+      state.waiters.length > 0 ||
+      state.pendingStreams > 0
+    ) {
+      return;
+    }
+    state.closeIssued = true;
+    void connection.close().catch((err) => {
+      console.warn("Error closing drained connection after GOAWAY:", err);
+    });
   }
 
   private notifyStreamSlotAvailable(state: ConnectionState) {
@@ -448,6 +495,7 @@ export class Libp2pGrpcClient {
       connection = await this.acquireConnection(false);
       const connectionKey = this.peerAddr.toString();
       state = this.getConnectionState(connection as object);
+      state.pendingStreams += 1;
       try {
         await this.waitForStreamSlot(state, undefined, timeout);
         state.activeStreams += 1;
@@ -455,6 +503,8 @@ export class Libp2pGrpcClient {
       } catch (err) {
         console.warn("[unaryCall] waiting for stream slot failed:", err);
         throw err;
+      } finally {
+        state.pendingStreams -= 1;
       }
       stream = await connection.newStream(this.protocol, {
         maxOutboundStreams: 50,
@@ -502,10 +552,10 @@ export class Libp2pGrpcClient {
         exitFlag = true;
         errMsg = `GOAWAY received: code=${info.errorCode}`;
         notifyResponseComplete?.(); // 唤醒等待中的 Promise
-        if (connection) {
-          void connection.close().catch((err) => {
-            console.warn("Error closing connection after GOAWAY:", err);
-          });
+        // 不在此处关闭连接：GOAWAY 只终结本次调用自己的流，连接上可能还有
+        // 其他并发调用的流在跑。标记后由最后一条流在 finally 中排空关闭。
+        if (state) {
+          state.goawayReceived = true;
         }
       };
       parser.onSettingsParsed = (settings) => {
@@ -714,6 +764,8 @@ export class Libp2pGrpcClient {
         state.activeStreams = Math.max(0, state.activeStreams - 1);
         this.notifyStreamSlotAvailable(state);
       }
+      // 本流已结束：若连接收到过 GOAWAY 且已无活跃流，此时才真正关闭。
+      this.closeConnectionIfDrained(connection, state);
     }
     if (exitFlag) {
       throw new Error(errMsg);
@@ -870,6 +922,7 @@ export class Libp2pGrpcClient {
         connectionKey = this.peerAddr.toString();
         state = this.getConnectionState(connection as object);
         if (state) {
+          state.pendingStreams += 1;
           try {
             await this.waitForStreamSlot(
               state,
@@ -881,6 +934,8 @@ export class Libp2pGrpcClient {
           } catch (err) {
             console.warn("[Call] waiting for stream slot failed:", err);
             throw err;
+          } finally {
+            state.pendingStreams -= 1;
           }
         }
         // AbortSignal.timeout() 一旦创建就无法取消：negotiateFully:false 下
@@ -951,10 +1006,11 @@ export class Libp2pGrpcClient {
           }
           // reportError 统一完成：标记已报错 + abort + 触发回调（幂等，不会重复触发）
           reportError(new Error(`GOAWAY received: code=${info.errorCode}`));
-          if (connection) {
-            void connection.close().catch((err) => {
-              console.warn("Error closing connection after GOAWAY:", err);
-            });
+          // 不在此处关闭连接：GOAWAY 只终结本次调用自己的流，连接上可能还有
+          // 其他并发调用的流在跑（并行生成时就是这种情形）。标记后由最后一条
+          // 流在 finally 中排空关闭。
+          if (state) {
+            state.goawayReceived = true;
           }
         };
         parser.onSettingsParsed = (settings) => {
@@ -1401,6 +1457,8 @@ export class Libp2pGrpcClient {
           state.activeStreams = Math.max(0, state.activeStreams - 1);
           this.notifyStreamSlotAvailable(state);
         }
+        // 本流已结束：若连接收到过 GOAWAY 且已无活跃流，此时才真正关闭。
+        this.closeConnectionIfDrained(connection, state);
       }
     })();
 
