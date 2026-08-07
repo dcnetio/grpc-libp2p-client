@@ -7,6 +7,8 @@ import { HPACK } from "./dc-http2/hpack.js";
 import type { Multiaddr } from "@multiformats/multiaddr";
 
 const dialTimeout = 5000; // 5秒
+// 仅用于「打开流」本身，不覆盖对端首字节的等待时间。
+const STREAM_OPEN_TIMEOUT_MS = 10000;
 const DEFAULT_SEND_WINDOW_TIMEOUT = 15000;
 const CALL_CLEANUP_TIMEOUT = 5000;
 
@@ -843,11 +845,30 @@ export class Libp2pGrpcClient {
             throw err;
           }
         }
-        stream = await connection.newStream(this.protocol, {
-          maxOutboundStreams: 50,
-          signal: AbortSignal.timeout(10000),
-          negotiateFully: false,
-        });
+        // AbortSignal.timeout() 一旦创建就无法取消：negotiateFully:false 下
+        // newStream 立即返回，这个信号却仍挂在流上，等对端首字节稍慢（模型排队、
+        // 服务端加锁）满 10 秒就把一条正常工作的流 abort 掉，报 "signal timed out"。
+        // 换成自有 controller，开流成功即 clearTimeout —— 只覆盖「开流」本身。
+        // ⚠️ abort 原因必须与 AbortSignal.timeout() 完全一致：上游按 "signal timed out"
+        // 子串把它归类为可忽略/可重试的连接问题，各包独立发版，改了文案会在版本
+        // 错配时把它误判成应用错误。
+        const openController = new AbortController();
+        const openTimer = setTimeout(
+          () =>
+            openController.abort(
+              new DOMException("signal timed out", "TimeoutError")
+            ),
+          STREAM_OPEN_TIMEOUT_MS
+        );
+        try {
+          stream = await connection.newStream(this.protocol, {
+            maxOutboundStreams: 50,
+            signal: openController.signal,
+            negotiateFully: false,
+          });
+        } finally {
+          clearTimeout(openTimer);
+        }
         const streamManager = this.getStreamManagerFor(connection as object);
         const streamId = await streamManager.getNextAppLevelStreamId();
         writer = new StreamWriter(stream, {
