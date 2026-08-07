@@ -11,6 +11,10 @@ const dialTimeout = 5000; // 5秒
 const STREAM_OPEN_TIMEOUT_MS = 10000;
 const DEFAULT_SEND_WINDOW_TIMEOUT = 15000;
 const CALL_CLEANUP_TIMEOUT = 5000;
+// 关闭流的最长等待。libp2p 的 stream.close() 会等待服务端半关闭确认，
+// 网络异常时可能永久挂起——此时底层 muxer 流仍占用 maxOutboundStreams 名额，
+// 大量重试累积的半开流最终触发 "too many outbound protocol streams" 重连风暴。
+const STREAM_CLOSE_TIMEOUT_MS = 5000;
 
 /**
  * 解码 gRPC `grpc-message` trailer。
@@ -63,6 +67,43 @@ type TransportProfile = "flow-control" | "compatibility";
 // dependency copies carry different generic/private identities.
 type Connection = Awaited<ReturnType<Libp2p["dial"]>>;
 type Stream = Awaited<ReturnType<Connection["newStream"]>>;
+
+/**
+ * 优雅关闭 libp2p 流，但不允许 close() 在网络异常时无限挂起。
+ * close() 会等待服务端半关闭确认；超过 STREAM_CLOSE_TIMEOUT_MS 仍未完成，
+ * 就强制 abort()——立即向 muxer 发送 RST 释放该流的名额，防止半开流堆积。
+ * 幂等且吞掉所有错误：清理路径不应再抛出。
+ */
+async function closeStreamWithTimeout(
+  stream: Stream,
+  timeoutMs = STREAM_CLOSE_TIMEOUT_MS,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
+  try {
+    await Promise.race([
+      stream.close(),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          resolve();
+        }, timeoutMs);
+      }),
+    ]);
+  } catch {
+    // close() 抛错通常意味着流已被 abort，无需再处理。
+    return;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+  if (timedOut) {
+    try {
+      stream.abort(new Error("stream close timeout"));
+    } catch {
+      /* abort 幂等，忽略 */
+    }
+  }
+}
 
 interface CallOptions {
   batchSize?: number;
@@ -666,11 +707,8 @@ export class Libp2pGrpcClient {
       // writer.abort() 内部幂等，成功路径下 writer.end() 已调用 cleanup()，安全。
       writerRef?.abort('unaryCall cleanup');
       if (stream) {
-        try {
-          await stream.close();
-        } catch {
-          // 流已被 abort，close() 会立即抛出，忽略即可。
-        }
+        // close() 超时会强制 abort，避免半开流长期占用 maxOutboundStreams 名额。
+        await closeStreamWithTimeout(stream);
       }
       if (streamSlotAcquired && state) {
         state.activeStreams = Math.max(0, state.activeStreams - 1);
@@ -1343,11 +1381,8 @@ export class Libp2pGrpcClient {
         // abort() 内部幂等，重复调用安全。
         writer?.abort('Call cleanup');
         if (stream) {
-          try {
-            await stream.close();
-          } catch {
-            // 流已被 abort，close() 会立即抛出，忽略即可。
-          }
+          // close() 超时会强制 abort，避免半开流长期占用 maxOutboundStreams 名额。
+          await closeStreamWithTimeout(stream);
         }
         // 如果本次强制使用了新连接，结束时尽量关闭它，避免连接泄漏
         if (options?.freshConnection) {
