@@ -17,6 +17,36 @@ const CALL_CLEANUP_TIMEOUT = 5000;
 const STREAM_CLOSE_TIMEOUT_MS = 5000;
 
 /**
+ * 判断池中连接是否还能复用。
+ * abort() 会把 status 置为 'aborted' 并写入 timeline.close，但它只转发 maConn 的
+ * close 事件、不转发 abort，所以 abort 掉的连接不会触发池的 close 监听，只能在
+ * 取用时主动判定。timeline.close 作为兜底，覆盖 status 未及时更新的传输实现。
+ */
+function isConnectionReusable(connection: Connection): boolean {
+  const status = connection.status;
+  if (status && status !== "open") {
+    return false;
+  }
+  if (connection.timeline?.close != null) {
+    return false;
+  }
+  return true;
+}
+
+/** 丢弃不可用连接时顺手释放底层资源，避免 muxer 名额泄漏。 */
+async function safeCloseConnection(connection: Connection): Promise<void> {
+  try {
+    await connection.close();
+  } catch {
+    try {
+      connection.abort(new Error("unusable pooled connection"));
+    } catch {
+      /* 已经关闭，忽略 */
+    }
+  }
+}
+
+/**
  * 解码 gRPC `grpc-message` trailer。
  * 按 gRPC 协议规范，该字段使用百分号编码（percent-encoding）承载 UTF-8 字节，
  * 非 ASCII 字符（如中文错误信息）会以 %XX 形式出现。直接透传会导致上层拿到
@@ -388,11 +418,18 @@ export class Libp2pGrpcClient {
       if (pooled) {
         const conn = pooled.connection;
         if (conn) {
-          const status = conn.status;
-          if (!status || status === "open") {
+          if (isConnectionReusable(conn)) {
             return conn;
           }
+          // 被 abort 的连接不派发 close 事件，靠监听剔除不掉。
+          // 复用它会让后续每次调用都超时，表现为"断线后再也连不上"。
+          console.warn(
+            `[grpc] dropping unusable pooled connection (status=${
+              conn.status ?? "unknown"
+            })`
+          );
           this.connectionPool.delete(key);
+          void safeCloseConnection(conn);
         } else {
           return pooled.promise;
         }
@@ -415,6 +452,9 @@ export class Libp2pGrpcClient {
               }
             };
             try {
+              // 注意：Connection.abort() 只向下传递给 muxer/maConn，不派发任何
+              // 事件，所以 abort 掉的连接无法靠监听剔除，只能在取用时用
+              // isConnectionReusable 主动判定。
               conn.addEventListener("close", removeFromPool, { once: true });
             } catch { /* ignore event listener registration errors */ }
           }
