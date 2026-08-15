@@ -9,6 +9,10 @@ import type { Multiaddr } from "@multiformats/multiaddr";
 const dialTimeout = 5000; // 5秒
 // 仅用于「打开流」本身，不覆盖对端首字节的等待时间。
 const STREAM_OPEN_TIMEOUT_MS = 10000;
+// 流开出来之后，对端多久没发过任何一帧就判定这条连接已经不通。
+// 按 HTTP/2，对端在收到 preface 后应当立即回 SETTINGS，这与应用层算得快慢无关，
+// 所以这个值可以放得很宽也不会误判「节点在跑构建、响应慢」。
+const PEER_SILENCE_TIMEOUT_MS = 15000;
 const DEFAULT_SEND_WINDOW_TIMEOUT = 15000;
 const CALL_CLEANUP_TIMEOUT = 5000;
 // 关闭流的最长等待。libp2p 的 stream.close() 会等待服务端半关闭确认，
@@ -148,6 +152,12 @@ interface ConnectionState {
   waiters: Array<{ resolve: () => void; reject: (error: Error) => void }>;
   /** 是否已收到 GOAWAY：此后不再复用该连接开新流，等既有流排空后关闭。 */
   goawayReceived: boolean;
+  /**
+   * 是否已被判定为不可用（开流失败）：与 GOAWAY 同样的处理——摘出连接池不再复用，
+   * 等既有流排空后关闭。status 仍是 'open' 但 multistream-select 不再应答的连接
+   * 只能这样识别，isConnectionReusable 看不出来。
+   */
+  evicted: boolean;
   /** 关闭是否已发起，保证排空关闭只执行一次。 */
   closeIssued: boolean;
   /**
@@ -180,17 +190,33 @@ class StreamManager {
   }
 }
 
+/**
+ * 连接池、每连接状态、每连接流号分配器都必须是**模块级**的。
+ *
+ * dcapi 的每个 RPC 方法里都是 `new Libp2pGrpcClient(...)`（全库 70+ 处），所以
+ * 这些表一旦挂在实例上，每次调用拿到的都是空表：
+ *  - 连接池永不命中，每次调用都重新 dial；而 libp2p 对同一个 peer 的 dial 会复用
+ *    同一条 Connection，于是 N 个并发调用**各自认为这条连接上只有自己一条流**，
+ *    maxConcurrentStreams 限流从不生效，一路把对端的流上限撑爆（表现为
+ *    TooManyOutboundProtocolStreams / 开不出新流 / 一直拉不下来，出去再回来又好了）；
+ *  - 摘池、GOAWAY 排空、静默看门狗同理：一个实例标记的驱逐，另一个实例看不见。
+ *
+ * 连接本身与 protocol / token 无关（两者只在 newStream 与请求头上用），按
+ * 「本地节点 + 目标地址」做键即可跨实例共享。
+ */
+const sharedConnectionStreamManagers: WeakMap<object, StreamManager> =
+  new WeakMap();
+const sharedConnectionStates: WeakMap<object, ConnectionState> = new WeakMap();
+const sharedConnectionPool: Map<
+  string,
+  { promise: Promise<Connection>; connection?: Connection }
+> = new Map();
+
 export class Libp2pGrpcClient {
   node: Libp2p;
   protocol: string;
   peerAddr: Multiaddr;
   token: string;
-  private connectionStreamManagers: WeakMap<object, StreamManager>;
-  private connectionStates: WeakMap<object, ConnectionState>;
-  private connectionPool: Map<
-    string,
-    { promise: Promise<Connection>; connection?: Connection }
-  >;
 
   constructor(
     node: Libp2p,
@@ -206,32 +232,36 @@ export class Libp2pGrpcClient {
       this.protocol = "/dc/thread/0.0.1";
     }
     this.token = token;
-    this.connectionStreamManagers = new WeakMap();
-    this.connectionStates = new WeakMap();
-    this.connectionPool = new Map();
+  }
+
+  /** 连接池键：同一个本地节点 + 同一个目标地址才算同一条连接 */
+  private get poolKey(): string {
+    const localId = (this.node as { peerId?: { toString(): string } }).peerId;
+    return `${localId ? localId.toString() : "node"}|${this.peerAddr.toString()}`;
   }
 
   private getStreamManagerFor(connection: object): StreamManager {
-    let manager = this.connectionStreamManagers.get(connection);
+    let manager = sharedConnectionStreamManagers.get(connection);
     if (!manager) {
       manager = new StreamManager();
-      this.connectionStreamManagers.set(connection, manager);
+      sharedConnectionStreamManagers.set(connection, manager);
     }
     return manager;
   }
 
   private getConnectionState(connection: object): ConnectionState {
-    let state = this.connectionStates.get(connection);
+    let state = sharedConnectionStates.get(connection);
     if (!state) {
       state = {
         activeStreams: 0,
         maxConcurrentStreams: Number.POSITIVE_INFINITY,
         waiters: [],
         goawayReceived: false,
+        evicted: false,
         closeIssued: false,
         pendingStreams: 0,
       };
-      this.connectionStates.set(connection, state);
+      sharedConnectionStates.set(connection, state);
     }
     return state;
   }
@@ -253,7 +283,7 @@ export class Libp2pGrpcClient {
     state: ConnectionState | null
   ) {
     if (!connection || !state) return;
-    if (!state.goawayReceived || state.closeIssued) return;
+    if ((!state.goawayReceived && !state.evicted) || state.closeIssued) return;
     // 三者都为空才算真正排空：活跃流、排队等槽位的调用、已拿到槽位但尚未计数的调用。
     if (
       state.activeStreams > 0 ||
@@ -266,6 +296,80 @@ export class Libp2pGrpcClient {
     void connection.close().catch((err) => {
       console.warn("Error closing drained connection after GOAWAY:", err);
     });
+  }
+
+  /**
+   * 把连接池里正是这一条的记录摘掉。
+   *
+   * 只认 connection 相同的条目：条目里没有 connection 时它是一次进行中的重拨，
+   * 那多半就是要替换它的新连接，按 key 无脑删会让并发调用各拨各的。
+   */
+  private dropPooledConnection(connection: Connection) {
+    const key = this.poolKey;
+    const pooled = sharedConnectionPool.get(key);
+    if (pooled && pooled.connection === connection) {
+      sharedConnectionPool.delete(key);
+    }
+  }
+
+  /**
+   * 「对端一帧都没发过」看门狗。
+   *
+   * newStream 成功不等于连接可用：multistream-select 应答了、HTTP/2 会话却一个字节
+   * 都不回的连接，status 仍是 'open'，开流也不报错，只会让每一次调用等满自己的超时
+   * （上传 60 秒、拉构建产物 60 秒 ×3），用户看到的就是「一直拉不下来」。
+   *
+   * 判据取「有没有收到任意一帧」而不是「响应有没有回来」：按 HTTP/2，对端在流建立
+   * 后立即发 SETTINGS，跟应用层算得多慢无关，所以慢节点不会被误判。
+   *
+   * 只摘池、不打断本次调用：本次仍按自己的超时走完，避免改变调用语义；真正的收益
+   * 在于下一次调用（含上层的重试）会拨一条新连接，而不是继续复用这条死的。
+   */
+  private armPeerSilenceWatchdog(
+    parser: HTTP2Parser,
+    connection: Connection | null,
+    state: ConnectionState | null,
+    tag: string
+  ) {
+    if (!connection) return;
+    const timer = setTimeout(() => {
+      this.evictConnection(
+        connection,
+        state,
+        `${tag}: peer sent no frames within ${PEER_SILENCE_TIMEOUT_MS}ms`
+      );
+    }, PEER_SILENCE_TIMEOUT_MS);
+    parser.onAnyFrame = () => {
+      clearTimeout(timer);
+      parser.onAnyFrame = undefined;
+    };
+  }
+
+  /**
+   * 把一条「看着还开着、实际已经打不开流」的连接摘出连接池。
+   *
+   * newStream 失败（协议协商超时、muxer 拒绝）时，连接的 status 往往仍是 'open'
+   * 且 timeline.close 为空，isConnectionReusable 判不出问题，于是 acquireConnection
+   * 会把同一条死连接一直发给后续每一次调用——表现为「一直拉不下来、点刷新也没用，
+   * 退出页面重进（换了 libp2p 节点）才恢复」。
+   *
+   * 关闭走和 GOAWAY 完全一样的排空路径：只做标记 + 摘池，真正的 close 交给最后
+   * 一条流结束时的 closeConnectionIfDrained，避免拆掉复用同一连接的兄弟流。
+   */
+  private evictConnection(
+    connection: Connection | null,
+    state: ConnectionState | null,
+    reason: string
+  ) {
+    if (!connection) return;
+    this.dropPooledConnection(connection);
+    if (!state || state.evicted) return;
+    state.evicted = true;
+    console.warn(`[grpc] evicting pooled connection: ${reason}`);
+    // 不动 waiters：它们等的是这条连接上的槽位，槽位一空照样可以试，失败也会各自
+    // 抛错。开流失败也可能只是 maxOutboundStreams 打满（连接本身好着），一并拒掉
+    // 会把本来能跑完的排队调用全部误杀。
+    this.closeConnectionIfDrained(connection, state);
   }
 
   private notifyStreamSlotAvailable(state: ConnectionState) {
@@ -412,9 +516,9 @@ export class Libp2pGrpcClient {
   }
 
   private async acquireConnection(forceNew: boolean): Promise<Connection> {
-    const key = this.peerAddr.toString();
+    const key = this.poolKey;
     if (!forceNew) {
-      const pooled = this.connectionPool.get(key);
+      const pooled = sharedConnectionPool.get(key);
       if (pooled) {
         const conn = pooled.connection;
         if (conn) {
@@ -428,7 +532,7 @@ export class Libp2pGrpcClient {
               conn.status ?? "unknown"
             })`
           );
-          this.connectionPool.delete(key);
+          sharedConnectionPool.delete(key);
           void safeCloseConnection(conn);
         } else {
           return pooled.promise;
@@ -442,13 +546,13 @@ export class Libp2pGrpcClient {
       })
       .then(async (conn) => {
         if (!forceNew) {
-          const poolEntry = this.connectionPool.get(key);
+          const poolEntry = sharedConnectionPool.get(key);
           if (poolEntry && poolEntry.promise === dialPromise) {
             poolEntry.connection = conn;
             const removeFromPool = () => {
-              const current = this.connectionPool.get(key);
+              const current = sharedConnectionPool.get(key);
               if (current && current.promise === dialPromise) {
-                this.connectionPool.delete(key);
+                sharedConnectionPool.delete(key);
               }
             };
             try {
@@ -463,16 +567,16 @@ export class Libp2pGrpcClient {
       })
       .catch((err) => {
         if (!forceNew) {
-          const pooled = this.connectionPool.get(key);
+          const pooled = sharedConnectionPool.get(key);
           if (pooled && pooled.promise === dialPromise) {
-            this.connectionPool.delete(key);
+            sharedConnectionPool.delete(key);
           }
         }
         throw err;
       });
 
     if (!forceNew) {
-      this.connectionPool.set(key, { promise: dialPromise });
+      sharedConnectionPool.set(key, { promise: dialPromise });
     }
 
     return dialPromise;
@@ -533,7 +637,6 @@ export class Libp2pGrpcClient {
     try {
       // const stream = await this.node.dialProtocol(this.peerAddr, this.protocol)
       connection = await this.acquireConnection(false);
-      const connectionKey = this.peerAddr.toString();
       state = this.getConnectionState(connection as object);
       state.pendingStreams += 1;
       try {
@@ -542,14 +645,54 @@ export class Libp2pGrpcClient {
         streamSlotAcquired = true;
       } catch (err) {
         console.warn("[unaryCall] waiting for stream slot failed:", err);
+        // 等满整个调用超时都排不到槽位，说明这条连接上的流只进不出（半开流泄漏
+        // 或对端不再放行），再排下去只是继续超时。摘池让下一次调用另拨一条。
+        this.evictConnection(
+          connection,
+          state,
+          `unaryCall stream slot unavailable: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
         throw err;
       } finally {
         state.pendingStreams -= 1;
       }
-      stream = await connection.newStream(this.protocol, {
-        maxOutboundStreams: 50,
-        negotiateFully: false,
-      });
+      // 不传 signal 时 libp2p 会自己挂一个 AbortSignal.timeout(协议协商超时) 到流上，
+      // 且 negotiateFully:false 下开流立即返回、这个信号却继续生效：对端首字节稍慢
+      // （节点在跑构建、模型排队）满 10 秒就把一条正常的流 abort 成
+      // "signal timed out"。流式调用早已换成自有 controller，unary 这条漏了。
+      // ⚠️ abort 原因必须与 AbortSignal.timeout() 完全一致："signal timed out"
+      // 子串是上游用来把它归类成可重试连接问题的依据，各包独立发版，改文案会在
+      // 版本错配时被误判成应用错误。
+      const openController = new AbortController();
+      const openTimer = setTimeout(
+        () =>
+          openController.abort(
+            new DOMException("signal timed out", "TimeoutError")
+          ),
+        STREAM_OPEN_TIMEOUT_MS
+      );
+      try {
+        stream = await connection.newStream(this.protocol, {
+          maxOutboundStreams: 50,
+          signal: openController.signal,
+          negotiateFully: false,
+        });
+      } catch (err) {
+        // 开流失败的连接不会被 isConnectionReusable 判出来，不摘池就会被后续每一次
+        // 调用继续复用，一直超时到用户重进页面为止。
+        this.evictConnection(
+          connection,
+          state,
+          `unaryCall newStream failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+        throw err;
+      } finally {
+        clearTimeout(openTimer);
+      }
       const streamManager = this.getStreamManagerFor(connection as object);
       const streamId = await streamManager.getNextAppLevelStreamId();
       const writer = new StreamWriter(stream, {
@@ -580,9 +723,10 @@ export class Libp2pGrpcClient {
         });
       } catch { /* ignore addEventListener errors */ }
       const parser = new HTTP2Parser(writer);
+      this.armPeerSilenceWatchdog(parser, connection, state, "unaryCall");
       parser.onGoaway = (info) => {
         console.warn("[unaryCall] GOAWAY received from server", info);
-        this.connectionPool.delete(connectionKey);
+        this.dropPooledConnection(connection!);
         if (state) {
           this.rejectStreamWaiters(
             state,
@@ -928,7 +1072,6 @@ export class Libp2pGrpcClient {
       };
       const hpack = new HPACK();
       let connection: Connection | null = null;
-      let connectionKey: string | null = null;
       let state: ConnectionState | null = null;
       let streamSlotAcquired = false;
       // 提升 writer 作用域到 finally 可访问，确保 unary/server-streaming 模式下也能清理资源
@@ -943,7 +1086,7 @@ export class Libp2pGrpcClient {
         // 如开启 freshConnection，则在拨号前尝试断开现有连接，确保本次使用全新连接（注意：会影响与该节点的其他并发）
         if (options?.freshConnection) {
           try {
-            this.connectionPool.delete(this.peerAddr.toString());
+            sharedConnectionPool.delete(this.poolKey);
             await this.node.hangUp(this.peerAddr);
             console.warn(
               "[Call] hangUp existing connection before dialing due to freshConnection=true"
@@ -959,7 +1102,6 @@ export class Libp2pGrpcClient {
         connection = await this.acquireConnection(
           Boolean(options?.freshConnection)
         );
-        connectionKey = this.peerAddr.toString();
         state = this.getConnectionState(connection as object);
         if (state) {
           state.pendingStreams += 1;
@@ -973,6 +1115,14 @@ export class Libp2pGrpcClient {
             streamSlotAcquired = true;
           } catch (err) {
             console.warn("[Call] waiting for stream slot failed:", err);
+            // 同 unaryCall：排不到槽位说明这条连接上的流只进不出，摘池另拨。
+            this.evictConnection(
+              connection,
+              state,
+              `Call stream slot unavailable: ${
+                err instanceof Error ? err.message : String(err)
+              }`
+            );
             throw err;
           } finally {
             state.pendingStreams -= 1;
@@ -999,6 +1149,17 @@ export class Libp2pGrpcClient {
             signal: openController.signal,
             negotiateFully: false,
           });
+        } catch (err) {
+          // 同 unaryCall：开不出流的连接 status 仍是 'open'，不主动摘池就会被
+          // 一直复用下去。
+          this.evictConnection(
+            connection,
+            state,
+            `Call newStream failed: ${
+              err instanceof Error ? err.message : String(err)
+            }`
+          );
+          throw err;
         } finally {
           clearTimeout(openTimer);
         }
@@ -1033,10 +1194,11 @@ export class Libp2pGrpcClient {
         const parser = new HTTP2Parser(writer!, {
           compatibilityMode: !useFlowControl,
         });
+        this.armPeerSilenceWatchdog(parser, connection, state, "Call");
         parser.onGoaway = (info) => {
           console.warn("[Call] GOAWAY received from server", info);
-          if (connectionKey) {
-            this.connectionPool.delete(connectionKey);
+          if (connection) {
+            this.dropPooledConnection(connection);
           }
           if (state) {
             this.rejectStreamWaiters(

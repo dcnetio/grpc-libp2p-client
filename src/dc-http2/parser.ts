@@ -36,6 +36,12 @@ export class HTTP2Parser {
   onHeaders?: (headers: Uint8Array, frameHeader: Frame) => void;
   onGoaway?: (info: { lastStreamId?: number; errorCode?: number }) => void;
   onSettingsParsed?: (settings: { maxConcurrentStreams?: number; initialWindowSize?: number }) => void;
+  /**
+   * 收到任意一帧（含 SETTINGS/PING/WINDOW_UPDATE）时回调一次，供上层判断
+   * 「这条流上对端到底有没有说过话」。onSettingsParsed 只在 SETTINGS 带了
+   * maxConcurrentStreams 或窗口变化时才触发，不能拿来当「有无入站帧」的信号。
+   */
+  onAnyFrame?: () => void;
   endFlag: boolean;
   writer: StreamWriter;
   private readonly compatibilityMode: boolean;
@@ -328,6 +334,13 @@ export class HTTP2Parser {
 
   // 处理单个帧
   async _handleFrame(frameHeader: Frame, frameData: Uint8Array) {
+    if (this.onAnyFrame) {
+      try {
+        this.onAnyFrame();
+      } catch (err) {
+        console.error('Error handling onAnyFrame callback:', err);
+      }
+    }
     switch (frameHeader.type) {
       case FRAME_TYPES.SETTINGS:
         if ((frameHeader.flags & FRAME_FLAGS.ACK) === FRAME_FLAGS.ACK) {
