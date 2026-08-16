@@ -21,6 +21,24 @@ const CALL_CLEANUP_TIMEOUT = 5000;
 const STREAM_CLOSE_TIMEOUT_MS = 5000;
 
 /**
+ * muxer 是否已经死了。
+ *
+ * libp2p 的 Connection.status 取自 maConn（底层 socket），而 newStream 第一件事是
+ * 校验 `muxer.status !== 'open'` 并抛 `The connection muxer is "closing" and not
+ * "open"`。yamux 先关、socket 后关的窗口里，这条连接的 status 仍然是 'open'：
+ * 它「看着好好的、开流必炸」。控制台里同一个 ConnectionClosedError 刷几十条、
+ * 换页面重进才恢复，就是这种僵尸连接被反复取用的结果。
+ *
+ * 用结构化取值而不是引用 libp2p 类型：本库允许被另一份 @libp2p/interface 安装
+ * 消费，拿不到 muxer 字段时按「还活着」处理，不改变旧行为。
+ */
+function isConnectionMuxerDead(connection: Connection): boolean {
+  const status = (connection as unknown as { muxer?: { status?: string } })
+    .muxer?.status;
+  return status != null && status !== "open";
+}
+
+/**
  * 判断池中连接是否还能复用。
  * abort() 会把 status 置为 'aborted' 并写入 timeline.close，但它只转发 maConn 的
  * close 事件、不转发 abort，所以 abort 掉的连接不会触发池的 close 监听，只能在
@@ -34,19 +52,39 @@ function isConnectionReusable(connection: Connection): boolean {
   if (connection.timeline?.close != null) {
     return false;
   }
+  if (isConnectionMuxerDead(connection)) {
+    return false;
+  }
   return true;
+}
+
+/**
+ * 立刻把一条僵尸连接从 libp2p 的连接表里赶出去。
+ *
+ * 必须是 abort 而不是 close：close() 是优雅关闭，要等对端确认，muxer 都没了的
+ * 连接上它要么以 `AggregateError: All promises were rejected` 失败、要么直接挂住；
+ * 只要 maConn.status 还是 'open'，connection-manager 的 findExistingConnection
+ * （只看 status，不看 muxer）就会把这条连接继续发给下一次 dial——于是「摘出连接池
+ * 再重拨」拿回来的还是它。abort() 同步把 status 置为非 open，dial 才会真的重连。
+ */
+function discardDeadConnection(connection: Connection, reason: string): void {
+  try {
+    connection.abort(new Error(reason));
+  } catch {
+    /* 已经关闭，忽略 */
+  }
 }
 
 /** 丢弃不可用连接时顺手释放底层资源，避免 muxer 名额泄漏。 */
 async function safeCloseConnection(connection: Connection): Promise<void> {
+  if (isConnectionMuxerDead(connection)) {
+    discardDeadConnection(connection, "unusable pooled connection");
+    return;
+  }
   try {
     await connection.close();
   } catch {
-    try {
-      connection.abort(new Error("unusable pooled connection"));
-    } catch {
-      /* 已经关闭，忽略 */
-    }
+    discardDeadConnection(connection, "unusable pooled connection");
   }
 }
 
@@ -293,8 +331,17 @@ export class Libp2pGrpcClient {
       return;
     }
     state.closeIssued = true;
+    if (isConnectionMuxerDead(connection)) {
+      // muxer 已经没了，close() 只会失败或挂住，而只要 maConn 还是 'open'，
+      // libp2p 的 dial 就会继续把这条连接发回来。
+      discardDeadConnection(connection, "connection muxer already closed");
+      return;
+    }
     void connection.close().catch((err) => {
       console.warn("Error closing drained connection after GOAWAY:", err);
+      // close() 失败后连接往往仍停在 'open'，findExistingConnection 会一直挑中它。
+      // 必须 abort 兜底，否则「关不掉的连接」就是下一轮报错的源头。
+      discardDeadConnection(connection, "graceful close failed");
     });
   }
 
@@ -349,9 +396,9 @@ export class Libp2pGrpcClient {
    * 把一条「看着还开着、实际已经打不开流」的连接摘出连接池。
    *
    * newStream 失败（协议协商超时、muxer 拒绝）时，连接的 status 往往仍是 'open'
-   * 且 timeline.close 为空，isConnectionReusable 判不出问题，于是 acquireConnection
-   * 会把同一条死连接一直发给后续每一次调用——表现为「一直拉不下来、点刷新也没用，
-   * 退出页面重进（换了 libp2p 节点）才恢复」。
+   * 且 timeline.close 为空，于是 acquireConnection 会把同一条死连接一直发给后续
+   * 每一次调用——表现为「一直拉不下来、点刷新也没用，退出页面重进（换了 libp2p
+   * 节点）才恢复」。
    *
    * 关闭走和 GOAWAY 完全一样的排空路径：只做标记 + 摘池，真正的 close 交给最后
    * 一条流结束时的 closeConnectionIfDrained，避免拆掉复用同一连接的兄弟流。
@@ -387,6 +434,119 @@ export class Libp2pGrpcClient {
       } catch (err) {
         console.error("Error resolving stream waiter:", err);
       }
+    }
+  }
+
+  /** 归还一条流占用的槽位，并在连接已排空时真正关闭它。 */
+  private releaseStreamSlot(
+    connection: Connection | null,
+    state: ConnectionState | null
+  ) {
+    if (!state) return;
+    state.activeStreams = Math.max(0, state.activeStreams - 1);
+    this.notifyStreamSlotAvailable(state);
+    this.closeConnectionIfDrained(connection, state);
+  }
+
+  /**
+   * 取连接 + 排槽位 + 开流，开流失败时最多重拨一次。
+   *
+   * evictConnection 只保证「下一次调用」不再拿到这条死连接，本次仍旧抛错。但池里
+   * 的连接随时可能在浏览器挂起、节点重启、GOAWAY 排空的空档里 muxer 先关掉，而
+   * connection.status（取自 maConn）还是 'open'——用户侧就表现为「生成到一半忽然
+   * 报 The connection muxer is "closing"」，紧接着手动重来一次又好了。此处请求一个
+   * 字节都还没写出去（HTTP/2 头都在开流之后才发），重开一条流不存在重复提交的
+   * 副作用。
+   *
+   * 只在「连接确实已经死了」时重试，且必须先 discardDeadConnection：dial 命中既有
+   * 连接只看 status 不看 muxer，不 abort 掉重拨拿回来的还是同一条僵尸。连接仍然
+   * 健康时开流失败（打满 maxOutboundStreams、协商超时）再拨一次只是把同一个错误
+   * 推迟一个 dialTimeout，直接抛错。
+   */
+  private async openCallStream(
+    tag: string,
+    timeout: number,
+    signal: AbortSignal | undefined,
+    forceNew: boolean
+  ): Promise<{
+    connection: Connection;
+    state: ConnectionState;
+    stream: Stream;
+  }> {
+    let retried = false;
+    for (;;) {
+      const connection = await this.acquireConnection(forceNew);
+      const state = this.getConnectionState(connection as object);
+      state.pendingStreams += 1;
+      try {
+        await this.waitForStreamSlot(state, signal, timeout);
+        state.activeStreams += 1;
+      } catch (err) {
+        console.warn(`[${tag}] waiting for stream slot failed:`, err);
+        // 等满整个调用超时都排不到槽位，说明这条连接上的流只进不出（半开流泄漏
+        // 或对端不再放行），再排下去只是继续超时。摘池让下一次调用另拨一条。
+        this.evictConnection(
+          connection,
+          state,
+          `${tag} stream slot unavailable: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+        throw err;
+      } finally {
+        state.pendingStreams -= 1;
+      }
+      // 不传 signal 时 libp2p 会自己挂一个 AbortSignal.timeout(协议协商超时) 到流上，
+      // 且 negotiateFully:false 下开流立即返回、这个信号却继续生效：对端首字节稍慢
+      // （节点在跑构建、模型排队）满 10 秒就把一条正常的流 abort 成
+      // "signal timed out"。换成自有 controller，开流成功即 clearTimeout。
+      // ⚠️ abort 原因必须与 AbortSignal.timeout() 完全一致："signal timed out"
+      // 子串是上游用来把它归类成可重试连接问题的依据，各包独立发版，改文案会在
+      // 版本错配时被误判成应用错误。
+      const openController = new AbortController();
+      const openTimer = setTimeout(
+        () =>
+          openController.abort(
+            new DOMException("signal timed out", "TimeoutError")
+          ),
+        STREAM_OPEN_TIMEOUT_MS
+      );
+      let stream: Stream;
+      try {
+        stream = await connection.newStream(this.protocol, {
+          maxOutboundStreams: 50,
+          signal: openController.signal,
+          negotiateFully: false,
+        });
+      } catch (err) {
+        // 开流失败的连接不会被 isConnectionReusable 判出来，不摘池就会被后续每一次
+        // 调用继续复用，一直超时到用户重进页面为止。
+        const reason = `${tag} newStream failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`;
+        // 复查一次：开流失败之后连接才露出马脚（muxer 已关、maConn 刚断），这时
+        // 它是「拿到手里才死的」，本次调用一个字节都还没写出去，重开一条流没有
+        // 重复提交的副作用。反之若连接仍然健康（打满 maxOutboundStreams、协商
+        // 超时），重拨只会拿回同一条连接、再赔进去一个超时，直接抛错更诚实。
+        const connectionDied = !isConnectionReusable(connection);
+        this.releaseStreamSlot(connection, state);
+        this.evictConnection(connection, state, reason);
+        if (connectionDied) {
+          // 必须在重拨之前赶走它：dial 命中既有连接只看 status，不看 muxer。
+          discardDeadConnection(connection, reason);
+        }
+        if (retried || !connectionDied || signal?.aborted) {
+          throw err;
+        }
+        retried = true;
+        console.warn(
+          `[${tag}] retrying on a freshly dialed connection after newStream failure`
+        );
+        continue;
+      } finally {
+        clearTimeout(openTimer);
+      }
+      return { connection, state, stream };
     }
   }
 
@@ -636,63 +796,16 @@ export class Libp2pGrpcClient {
     let writerRef: StreamWriter | null = null;
     try {
       // const stream = await this.node.dialProtocol(this.peerAddr, this.protocol)
-      connection = await this.acquireConnection(false);
-      state = this.getConnectionState(connection as object);
-      state.pendingStreams += 1;
-      try {
-        await this.waitForStreamSlot(state, undefined, timeout);
-        state.activeStreams += 1;
-        streamSlotAcquired = true;
-      } catch (err) {
-        console.warn("[unaryCall] waiting for stream slot failed:", err);
-        // 等满整个调用超时都排不到槽位，说明这条连接上的流只进不出（半开流泄漏
-        // 或对端不再放行），再排下去只是继续超时。摘池让下一次调用另拨一条。
-        this.evictConnection(
-          connection,
-          state,
-          `unaryCall stream slot unavailable: ${
-            err instanceof Error ? err.message : String(err)
-          }`
-        );
-        throw err;
-      } finally {
-        state.pendingStreams -= 1;
-      }
-      // 不传 signal 时 libp2p 会自己挂一个 AbortSignal.timeout(协议协商超时) 到流上，
-      // 且 negotiateFully:false 下开流立即返回、这个信号却继续生效：对端首字节稍慢
-      // （节点在跑构建、模型排队）满 10 秒就把一条正常的流 abort 成
-      // "signal timed out"。流式调用早已换成自有 controller，unary 这条漏了。
-      // ⚠️ abort 原因必须与 AbortSignal.timeout() 完全一致："signal timed out"
-      // 子串是上游用来把它归类成可重试连接问题的依据，各包独立发版，改文案会在
-      // 版本错配时被误判成应用错误。
-      const openController = new AbortController();
-      const openTimer = setTimeout(
-        () =>
-          openController.abort(
-            new DOMException("signal timed out", "TimeoutError")
-          ),
-        STREAM_OPEN_TIMEOUT_MS
+      const opened = await this.openCallStream(
+        "unaryCall",
+        timeout,
+        undefined,
+        false
       );
-      try {
-        stream = await connection.newStream(this.protocol, {
-          maxOutboundStreams: 50,
-          signal: openController.signal,
-          negotiateFully: false,
-        });
-      } catch (err) {
-        // 开流失败的连接不会被 isConnectionReusable 判出来，不摘池就会被后续每一次
-        // 调用继续复用，一直超时到用户重进页面为止。
-        this.evictConnection(
-          connection,
-          state,
-          `unaryCall newStream failed: ${
-            err instanceof Error ? err.message : String(err)
-          }`
-        );
-        throw err;
-      } finally {
-        clearTimeout(openTimer);
-      }
+      connection = opened.connection;
+      state = opened.state;
+      streamSlotAcquired = true;
+      stream = opened.stream;
       const streamManager = this.getStreamManagerFor(connection as object);
       const streamId = await streamManager.getNextAppLevelStreamId();
       const writer = new StreamWriter(stream, {
@@ -1099,70 +1212,16 @@ export class Libp2pGrpcClient {
           }
         }
 
-        connection = await this.acquireConnection(
+        const opened = await this.openCallStream(
+          "Call",
+          timeout,
+          internalController.signal,
           Boolean(options?.freshConnection)
         );
-        state = this.getConnectionState(connection as object);
-        if (state) {
-          state.pendingStreams += 1;
-          try {
-            await this.waitForStreamSlot(
-              state,
-              internalController.signal,
-              timeout
-            );
-            state.activeStreams += 1;
-            streamSlotAcquired = true;
-          } catch (err) {
-            console.warn("[Call] waiting for stream slot failed:", err);
-            // 同 unaryCall：排不到槽位说明这条连接上的流只进不出，摘池另拨。
-            this.evictConnection(
-              connection,
-              state,
-              `Call stream slot unavailable: ${
-                err instanceof Error ? err.message : String(err)
-              }`
-            );
-            throw err;
-          } finally {
-            state.pendingStreams -= 1;
-          }
-        }
-        // AbortSignal.timeout() 一旦创建就无法取消：negotiateFully:false 下
-        // newStream 立即返回，这个信号却仍挂在流上，等对端首字节稍慢（模型排队、
-        // 服务端加锁）满 10 秒就把一条正常工作的流 abort 掉，报 "signal timed out"。
-        // 换成自有 controller，开流成功即 clearTimeout —— 只覆盖「开流」本身。
-        // ⚠️ abort 原因必须与 AbortSignal.timeout() 完全一致：上游按 "signal timed out"
-        // 子串把它归类为可忽略/可重试的连接问题，各包独立发版，改了文案会在版本
-        // 错配时把它误判成应用错误。
-        const openController = new AbortController();
-        const openTimer = setTimeout(
-          () =>
-            openController.abort(
-              new DOMException("signal timed out", "TimeoutError")
-            ),
-          STREAM_OPEN_TIMEOUT_MS
-        );
-        try {
-          stream = await connection.newStream(this.protocol, {
-            maxOutboundStreams: 50,
-            signal: openController.signal,
-            negotiateFully: false,
-          });
-        } catch (err) {
-          // 同 unaryCall：开不出流的连接 status 仍是 'open'，不主动摘池就会被
-          // 一直复用下去。
-          this.evictConnection(
-            connection,
-            state,
-            `Call newStream failed: ${
-              err instanceof Error ? err.message : String(err)
-            }`
-          );
-          throw err;
-        } finally {
-          clearTimeout(openTimer);
-        }
+        connection = opened.connection;
+        state = opened.state;
+        streamSlotAcquired = true;
+        stream = opened.stream;
         const streamManager = this.getStreamManagerFor(connection as object);
         const streamId = await streamManager.getNextAppLevelStreamId();
         writer = new StreamWriter(stream, {
