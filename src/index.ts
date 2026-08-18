@@ -59,6 +59,18 @@ function isConnectionReusable(connection: Connection): boolean {
 }
 
 /**
+ * `newStream` 超时与业务 RPC 响应超时不同：此时连协议协商都没有完成。
+ * libp2p 的连接状态可能仍显示为 open，但下一次开流通常还会命中同一条半死连接。
+ */
+function isStreamOpenTimeout(error: unknown): boolean {
+  if (error == null) return false;
+  const candidate = error as { name?: unknown; message?: unknown };
+  const name = String(candidate.name || "");
+  const message = String(candidate.message || error);
+  return /signal timed out/i.test(message) && /timeout/i.test(name || message);
+}
+
+/**
  * 立刻把一条僵尸连接从 libp2p 的连接表里赶出去。
  *
  * 必须是 abort 而不是 close：close() 是优雅关闭，要等对端确认，muxer 都没了的
@@ -526,16 +538,25 @@ export class Libp2pGrpcClient {
         }`;
         // 复查一次：开流失败之后连接才露出马脚（muxer 已关、maConn 刚断），这时
         // 它是「拿到手里才死的」，本次调用一个字节都还没写出去，重开一条流没有
-        // 重复提交的副作用。反之若连接仍然健康（打满 maxOutboundStreams、协商
-        // 超时），重拨只会拿回同一条连接、再赔进去一个超时，直接抛错更诚实。
+        // 重复提交的副作用。`signal timed out` 同样属于这个路径：协议协商超时后
+        // status 可能还保持 open，若不主动丢弃，下一次 dial 会复用同一条连接。
+        // 有其它活跃流时不能据此中止整条连接，等待上层重试即可，避免误伤并行请求。
         const connectionDied = !isConnectionReusable(connection);
-        this.releaseStreamSlot(connection, state);
-        this.evictConnection(connection, state, reason);
-        if (connectionDied) {
-          // 必须在重拨之前赶走它：dial 命中既有连接只看 status，不看 muxer。
+        const streamOpenTimedOut = isStreamOpenTimeout(err);
+        const hasSiblingStreams =
+          state.activeStreams > 1 ||
+          state.pendingStreams > 0 ||
+          state.waiters.length > 0;
+        const canReplaceConnection =
+          connectionDied || (streamOpenTimedOut && !hasSiblingStreams);
+        if (canReplaceConnection) {
+          // libp2p 的 dial 只看 Connection.status；必须先 abort，才能保证下一轮
+          // 真的创建新连接，而不是再次取得这个 status 仍为 open 的僵尸连接。
           discardDeadConnection(connection, reason);
         }
-        if (retried || !connectionDied || signal?.aborted) {
+        this.releaseStreamSlot(connection, state);
+        this.evictConnection(connection, state, reason);
+        if (retried || !canReplaceConnection || signal?.aborted) {
           throw err;
         }
         retried = true;
