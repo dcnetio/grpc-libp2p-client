@@ -8,12 +8,14 @@ import type { Multiaddr } from "@multiformats/multiaddr";
 
 const dialTimeout = 5000; // 5秒
 // 仅用于「打开流」本身，不覆盖对端首字节的等待时间。
-const STREAM_OPEN_TIMEOUT_MS = 10000;
+// 发布环境经过公网 WSS/Relay 建流时，协议协商可能明显慢于本地开发节点。
+// 10 秒会把仍在恢复的连接误判为 signal timed out，并让所有并行请求一起重拨。
+const STREAM_OPEN_TIMEOUT_MS = 20000;
 // 流开出来之后，对端多久没发过任何一帧就判定这条连接已经不通。
 // 按 HTTP/2，对端在收到 preface 后应当立即回 SETTINGS，这与应用层算得快慢无关，
 // 所以这个值可以放得很宽也不会误判「节点在跑构建、响应慢」。
 const PEER_SILENCE_TIMEOUT_MS = 15000;
-const DEFAULT_SEND_WINDOW_TIMEOUT = 15000;
+const DEFAULT_SEND_WINDOW_TIMEOUT = 30000;
 const CALL_CLEANUP_TIMEOUT = 5000;
 // 关闭流的最长等待。libp2p 的 stream.close() 会等待服务端半关闭确认，
 // 网络异常时可能永久挂起——此时底层 muxer 流仍占用 maxOutboundStreams 名额，
