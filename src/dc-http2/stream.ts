@@ -1,4 +1,5 @@
 import { pushable, Pushable } from 'it-pushable'  
+import { createAbortController } from "../abort.js"
 
 /**
  * The client can be consumed from an application that owns a different
@@ -42,7 +43,7 @@ export class StreamWriter {
   //private p = pushable({ objectMode: false }) 
   
   private bytesWritten = 0  
-  private abortController = new AbortController()  
+  private abortController = createAbortController()
   
   // 背压控制相关属性  
   private backpressureHistory: number[] = []  

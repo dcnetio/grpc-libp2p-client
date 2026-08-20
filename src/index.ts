@@ -3,6 +3,7 @@ import { HTTP2Parser } from "./dc-http2/parser.js";
 import { StreamWriter } from "./dc-http2/stream.js";
 import { Http2Frame } from "./dc-http2/frame.js";
 import { HPACK } from "./dc-http2/hpack.js";
+import { createAbortController, createAbortError } from "./abort.js";
 
 import type { Multiaddr } from "@multiformats/multiaddr";
 
@@ -58,6 +59,11 @@ function isConnectionReusable(connection: Connection): boolean {
     return false;
   }
   return true;
+}
+
+function getAbortError(signal?: AbortSignal): Error {
+  const reason = signal?.reason;
+  return reason instanceof Error ? reason : new Error("Operation aborted");
 }
 
 /**
@@ -489,13 +495,26 @@ export class Libp2pGrpcClient {
   }> {
     let retried = false;
     for (;;) {
-      const connection = await this.acquireConnection(forceNew);
+      if (signal?.aborted) {
+        const reason = signal.reason;
+        throw reason instanceof Error ? reason : new Error("Operation aborted");
+      }
+      const connection = await this.acquireConnection(forceNew, signal);
       const state = this.getConnectionState(connection as object);
       state.pendingStreams += 1;
       try {
         await this.waitForStreamSlot(state, signal, timeout);
+        if (signal?.aborted) {
+          const reason = signal.reason;
+          throw reason instanceof Error
+            ? reason
+            : new Error("Operation aborted while opening HTTP/2 stream");
+        }
         state.activeStreams += 1;
       } catch (err) {
+        if (signal?.aborted) {
+          throw err;
+        }
         console.warn(`[${tag}] waiting for stream slot failed:`, err);
         // 等满整个调用超时都排不到槽位，说明这条连接上的流只进不出（半开流泄漏
         // 或对端不再放行），再排下去只是继续超时。摘池让下一次调用另拨一条。
@@ -517,14 +536,27 @@ export class Libp2pGrpcClient {
       // ⚠️ abort 原因必须与 AbortSignal.timeout() 完全一致："signal timed out"
       // 子串是上游用来把它归类成可重试连接问题的依据，各包独立发版，改文案会在
       // 版本错配时被误判成应用错误。
-      const openController = new AbortController();
+      const openController = createAbortController();
       const openTimer = setTimeout(
         () =>
           openController.abort(
-            new DOMException("signal timed out", "TimeoutError")
+            createAbortError("signal timed out", "TimeoutError")
           ),
         STREAM_OPEN_TIMEOUT_MS
       );
+      const abortOpen = () => {
+        const reason = signal?.reason;
+        openController.abort(
+          reason instanceof Error ? reason : new Error("Operation aborted")
+        );
+      };
+      if (signal) {
+        if (signal.aborted) {
+          abortOpen();
+        } else {
+          signal.addEventListener("abort", abortOpen, { once: true });
+        }
+      }
       let stream: Stream;
       try {
         stream = await connection.newStream(this.protocol, {
@@ -568,6 +600,7 @@ export class Libp2pGrpcClient {
         continue;
       } finally {
         clearTimeout(openTimer);
+        if (signal) signal.removeEventListener("abort", abortOpen);
       }
       return { connection, state, stream };
     }
@@ -698,7 +731,13 @@ export class Libp2pGrpcClient {
     }
   }
 
-  private async acquireConnection(forceNew: boolean): Promise<Connection> {
+  private async acquireConnection(
+    forceNew: boolean,
+    signal?: AbortSignal,
+  ): Promise<Connection> {
+    if (signal?.aborted) {
+      throw getAbortError(signal);
+    }
     const key = this.poolKey;
     if (!forceNew) {
       const pooled = sharedConnectionPool.get(key);
@@ -718,15 +757,35 @@ export class Libp2pGrpcClient {
           sharedConnectionPool.delete(key);
           void safeCloseConnection(conn);
         } else {
-          return pooled.promise;
+          if (!signal) return pooled.promise;
+          return await new Promise<Connection>((resolve, reject) => {
+            const onAbort = () => reject(getAbortError(signal));
+            signal.addEventListener("abort", onAbort, { once: true });
+            pooled.promise.then(
+              (connection) => {
+                signal.removeEventListener("abort", onAbort);
+                resolve(connection);
+              },
+              (error) => {
+                signal.removeEventListener("abort", onAbort);
+                reject(error);
+              },
+            );
+          });
         }
       }
     }
 
+    const dialController = createAbortController();
+    const dialTimer = setTimeout(
+      () => dialController.abort(new Error("Dial timed out")),
+      dialTimeout,
+    );
+    const abortDial = () => dialController.abort(getAbortError(signal));
+    if (signal) signal.addEventListener("abort", abortDial, { once: true });
+
     const dialPromise = this.node
-      .dial(this.peerAddr, {
-        signal: AbortSignal.timeout(dialTimeout),
-      })
+      .dial(this.peerAddr, { signal: dialController.signal })
       .then(async (conn) => {
         if (!forceNew) {
           const poolEntry = sharedConnectionPool.get(key);
@@ -756,6 +815,10 @@ export class Libp2pGrpcClient {
           }
         }
         throw err;
+      })
+      .finally(() => {
+        clearTimeout(dialTimer);
+        if (signal) signal.removeEventListener("abort", abortDial);
       });
 
     if (!forceNew) {
@@ -798,7 +861,8 @@ export class Libp2pGrpcClient {
   async unaryCall(
     method: string,
     requestData: Uint8Array,
-    timeout: number = 30000
+    timeout: number = 30000,
+    signal?: AbortSignal,
   ): Promise<Uint8Array> {
     let stream: Stream | null = null;
     let responseData: Uint8Array | null = null;
@@ -817,12 +881,43 @@ export class Libp2pGrpcClient {
     let streamSlotAcquired = false;
     // 提升 writer 作用域到 finally 可访问，确保错误路径下也能调用 abort() 清理资源
     let writerRef: StreamWriter | null = null;
+    let abortReject: ((error: Error) => void) | null = null;
+    const abortError = (): Error => {
+      const reason = signal?.reason;
+      return reason instanceof Error ? reason : new Error("Operation aborted");
+    };
+    const abortPromise = signal
+      ? new Promise<never>((_, reject) => {
+          abortReject = reject;
+        })
+      : null;
+    // 取消可以发生在开流或握手阶段；该拒绝稍后会被主流程抛出，先绑定兜底
+    // handler 避免 Promise 尚未被 race 消费时触发 unhandled rejection。
+    void abortPromise?.catch(() => undefined);
+    const abortListener = () => {
+      const error = abortError();
+      try {
+        writerRef?.abort("unaryCall cancelled");
+      } catch {
+        /* cleanup is best effort */
+      }
+      try {
+        stream?.abort(error);
+      } catch {
+        /* cleanup is best effort */
+      }
+      abortReject?.(error);
+    };
+    if (signal) {
+      if (signal.aborted) throw abortError();
+      signal.addEventListener("abort", abortListener, { once: true });
+    }
     try {
       // const stream = await this.node.dialProtocol(this.peerAddr, this.protocol)
       const opened = await this.openCallStream(
         "unaryCall",
         timeout,
-        undefined,
+        signal,
         false
       );
       connection = opened.connection;
@@ -1046,12 +1141,12 @@ export class Libp2pGrpcClient {
           streamId,
           df,
           writer,
-          undefined,
+          signal,
           frameSendTimeout
         );
       }
       // 等待 responseData 不为空，或超时（事件驱动，不轮询）
-      await new Promise<void>((resolve, reject) => {
+      const responseWait = new Promise<void>((resolve, reject) => {
         if (isResponseComplete || exitFlag) { resolve(); return; }
         const t = setTimeout(() => {
           notifyResponseComplete = null;
@@ -1063,6 +1158,11 @@ export class Libp2pGrpcClient {
           resolve();
         };
       });
+      if (abortPromise) {
+        await Promise.race([responseWait, abortPromise]);
+      } else {
+        await responseWait;
+      }
       try {
         await writer.flush(timeout);
       } catch { /* ignore flush errors */ }
@@ -1086,6 +1186,8 @@ export class Libp2pGrpcClient {
       }
       // 本流已结束：若连接收到过 GOAWAY 且已无活跃流，此时才真正关闭。
       this.closeConnectionIfDrained(connection, state);
+      if (signal) signal.removeEventListener("abort", abortListener);
+      abortReject = null;
     }
     if (exitFlag) {
       throw new Error(errMsg);
@@ -1124,7 +1226,7 @@ export class Libp2pGrpcClient {
     options?: CallOptions
   ) {
     // 创建内部AbortController用于控制操作
-    const internalController = new AbortController();
+    const internalController = createAbortController();
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
     let stream: Stream | null = null;
     // 保存外部 abort 监听器引用，以便操作结束后移除，防止内存泄漏
